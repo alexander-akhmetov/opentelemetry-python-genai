@@ -1,0 +1,20 @@
+interactions:
+- request:
+    body: '{"model": "claude-3-7-sonnet-20250219", "messages": [{"role": "user", "content":
+      [{"type": "text", "text": "Who won the World Cup in 2018? Answer in one word
+      with no punctuation."}]}], "thinking": {"type": "enabled", "budget_tokens":
+      4000}, "max_tokens": 8096}'
+    headers: {}
+    method: POST
+    uri: https://api.anthropic.com/v1/messages
+  response:
+    body:
+      string: '{"id":"msg_011KX7d4TtALbugymC3Kb4oE","type":"message","role":"assistant","model":"claude-3-7-sonnet-20250219","content":[{"type":"thinking","thinking":"The
+        World Cup in 2018 was won by France. They defeated Croatia 4-2 in the final
+        match in Moscow, Russia.\n\nI need to answer in one word with no punctuation,
+        so my answer should simply be:\nFrance","signature":"ErUBCkYIBBgCIkAOLwDXty2UNgzsRPd4O0tNxqhaxPqqLw9isc2bDqyVS7Y87Cefkib8FVE9iTTjTSynEjrrHb+vei4K5pQrVOUrEgzCGfpi49gURMlFYTwaDGTEJyP22/PoNkje2CIwyiqcZqRj6rxDwzG0ayl3JQ2mi8x3iDIEuyP92Pw19EPRhATbpYiORzbaVoPUBuPEKh3gUYNSZwcjUAYNO01Qqo7GYFF08xO0MuULheotLRgC"},{"type":"text","text":"France"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":54,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":65,"service_tier":"standard"}}'
+    headers: {}
+    status:
+      code: 200
+      message: OK
+version: 1

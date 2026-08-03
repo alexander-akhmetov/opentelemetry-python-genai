@@ -7,7 +7,31 @@ OpenTelemetry smolagents Instrumentation
    :target: https://pypi.org/project/opentelemetry-instrumentation-genai-smolagents/
 
 This library provides OpenTelemetry instrumentation for `smolagents
-<https://github.com/huggingface/smolagents>`_.
+<https://github.com/huggingface/smolagents>`_. It wraps the smolagents model
+classes and emits a GenAI semantic-convention ``chat`` span and the matching
+metrics through ``opentelemetry-util-genai``.
+
+Agent runs (``invoke_agent``) and tool calls (``execute_tool``) are not
+instrumented yet. A model call made inside an agent run still gets a ``chat``
+span, but no agent span sits above it.
+
+A streamed model call, whether it comes from ``stream_outputs=True`` on an agent
+or from calling ``Model.generate_stream`` directly, gets a ``chat`` span that
+stays open until the caller drains the deltas. The span carries
+``gen_ai.request.stream``, and the call also records the
+``gen_ai.client.operation.time_to_first_chunk`` and
+``gen_ai.client.operation.time_per_output_chunk`` metrics.
+
+Known gaps:
+
+* The instrumentation patches ``generate`` and ``generate_stream`` on the model
+  classes that smolagents ships. A subclass that inherits either method is
+  instrumented. A subclass that overrides one is not: the override shadows the
+  patched method, so the call produces no ``chat`` span.
+* A streamed ``chat`` span reports no ``gen_ai.response.id`` and no
+  ``gen_ai.response.model``, because a smolagents stream delta carries neither.
+  The span reports ``gen_ai.response.finish_reasons`` only when the model
+  requested tool calls, which is the one stop reason the deltas make visible.
 
 Installation
 ------------
@@ -24,9 +48,12 @@ Usage
     from opentelemetry.instrumentation.genai.smolagents import (
         SmolagentsInstrumentor,
     )
+    from smolagents import InferenceClientModel
 
-    # Instrument smolagents
     SmolagentsInstrumentor().instrument()
+
+    model = InferenceClientModel()
+    model.generate([{"role": "user", "content": "How many seconds are in a week?"}])
 
 Configuration
 -------------
@@ -70,6 +97,12 @@ environment variable:
     )
 
     SmolagentsInstrumentor().instrument(completion_hook=my_hook)
+
+Conformance
+-----------
+
+The scenarios that check this package against the GenAI semantic conventions
+live under ``tests/conformance/``.
 
 References
 ----------

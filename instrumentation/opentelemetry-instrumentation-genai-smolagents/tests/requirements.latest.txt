@@ -26,7 +26,10 @@
 # This variant of the requirements aims to test the system using the newest
 # supported version of external dependencies.
 
-smolagents
+# openai/litellm are the model backends exercised by the VCR model tests; they
+# are test-only (not declared in pyproject.toml) so they live here.
+smolagents[openai,litellm]
+wrapt>=2.2.2
 
 -e util/opentelemetry-util-genai
 -e instrumentation/opentelemetry-instrumentation-genai-smolagents
