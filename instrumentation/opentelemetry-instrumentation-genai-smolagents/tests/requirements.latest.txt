@@ -27,7 +27,6 @@
 # supported version of external dependencies.
 
 smolagents
-wrapt>=2.2.2
 
 -e util/opentelemetry-util-genai
 -e instrumentation/opentelemetry-instrumentation-genai-smolagents

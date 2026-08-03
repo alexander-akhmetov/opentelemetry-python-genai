@@ -43,6 +43,34 @@ content, set the environment variable
 
     export OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_AND_EVENT
 
+Uploading Content to External Storage
+*************************************
+
+Captured prompt and completion content can be forwarded to external storage
+through a completion hook instead of being recorded inline. Select the built-in
+``upload`` hook and point it at a destination:
+
+::
+
+    export OTEL_INSTRUMENTATION_GENAI_COMPLETION_HOOK=upload
+    export OTEL_INSTRUMENTATION_GENAI_UPLOAD_BASE_PATH=/path/to/prompts  # or gs://my_bucket
+
+The ``upload`` hook is provided by ``opentelemetry-util-genai`` and requires its
+``[upload]`` extra. See the `opentelemetry-util-genai README
+<https://github.com/open-telemetry/opentelemetry-python-genai/blob/main/util/opentelemetry-util-genai/README.rst>`_
+for the other content-capture and upload options it owns.
+
+You can also pass a hook programmatically, which takes precedence over the
+environment variable:
+
+.. code-block:: python
+
+    from opentelemetry.instrumentation.genai.smolagents import (
+        SmolagentsInstrumentor,
+    )
+
+    SmolagentsInstrumentor().instrument(completion_hook=my_hook)
+
 References
 ----------
 

@@ -26,6 +26,12 @@ Message content capture can be configured by setting the environment variable
 ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT``. Supported values are
 ``NO_CONTENT``, ``SPAN_ONLY``, ``EVENT_ONLY``, and ``SPAN_AND_EVENT``.
 
+Captured content can be forwarded to external storage with a completion hook.
+Set ``OTEL_INSTRUMENTATION_GENAI_COMPLETION_HOOK=upload`` (with
+``OTEL_INSTRUMENTATION_GENAI_UPLOAD_BASE_PATH``), or pass one programmatically
+via ``instrument(completion_hook=...)`` which takes precedence over the
+environment variable.
+
 API
 ---
 """
