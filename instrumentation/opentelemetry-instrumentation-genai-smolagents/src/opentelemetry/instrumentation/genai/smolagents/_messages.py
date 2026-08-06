@@ -24,6 +24,7 @@ from opentelemetry.util.genai.types import (
     Blob,
     FunctionToolDefinition,
     InputMessage,
+    MessagePart,
     OutputMessage,
     Reasoning,
     Text,
@@ -134,8 +135,8 @@ def _image_part_from_element(element: dict[str, Any]) -> Uri | Blob | None:
     return None
 
 
-def _parts_from_content(content: Any) -> list[Any]:
-    parts: list[Any] = []
+def _parts_from_content(content: Any) -> list[MessagePart]:
+    parts: list[MessagePart] = []
     if isinstance(content, str):
         parts.append(Text(content=content))
         return parts
@@ -150,8 +151,7 @@ def _parts_from_content(content: Any) -> list[Any]:
             if element.get("type") == "text" and (text := element.get("text")):
                 parts.append(Text(content=text))
                 continue
-            image_part = _image_part_from_element(element)
-            if image_part is not None:
+            if image_part := _image_part_from_element(element):
                 parts.append(image_part)
             else:
                 _logger.debug(
@@ -244,9 +244,7 @@ def _finish_reason(output_message: Any, has_tool_calls: bool) -> str | None:
 def to_output_message(output_message: Any) -> OutputMessage:
     """Map a smolagents ``ChatMessage`` response to an ``OutputMessage``."""
     role = _unwrap_role(getattr(output_message, "role", None)) or "assistant"
-    parts: list[Any] = _parts_from_content(
-        getattr(output_message, "content", None)
-    )
+    parts = _parts_from_content(getattr(output_message, "content", None))
     if reasoning := _reasoning_from_raw(output_message):
         parts.append(Reasoning(content=reasoning))
     tool_call_requests = _tool_call_requests(output_message)

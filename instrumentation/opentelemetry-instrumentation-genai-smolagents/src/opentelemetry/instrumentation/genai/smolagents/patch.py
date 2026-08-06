@@ -28,7 +28,12 @@ from opentelemetry.semconv._incubating.attributes import (
 from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.invocation import InferenceInvocation
 from opentelemetry.util.genai.stream import SyncStreamWrapper
-from opentelemetry.util.genai.types import OutputMessage, Text, ToolCallRequest
+from opentelemetry.util.genai.types import (
+    MessagePart,
+    OutputMessage,
+    Text,
+    ToolCallRequest,
+)
 
 from ._messages import (
     response_id,
@@ -275,25 +280,22 @@ def model_generate(handler: TelemetryHandler) -> _Wrapper:
         kwargs: dict[str, Any],
     ) -> Any:
         invocation = _start_inference(handler, wrapped, instance, args, kwargs)
-
-        try:
+        with invocation:
             output_message = wrapped(*args, **kwargs)
-        except Exception as error:  # pylint: disable=broad-except
-            invocation.fail(error)
-            raise
-
-        _apply_token_usage(invocation, output_message)
-        invocation.response_model_name = response_model_name(output_message)
-        invocation.response_id = response_id(output_message)
-        output = to_output_message(output_message)
-        # to_output_message leaves finish_reason empty when the provider
-        # reported none, and an empty value is dropped rather than guessed at.
-        if output.finish_reason:
-            invocation.finish_reasons = [output.finish_reason]
-        if handler.should_capture_content():
-            invocation.output_messages = [output]
-        invocation.stop()
-        return output_message
+            _apply_token_usage(invocation, output_message)
+            invocation.response_model_name = response_model_name(
+                output_message
+            )
+            invocation.response_id = response_id(output_message)
+            output = to_output_message(output_message)
+            # to_output_message leaves finish_reason empty when the provider
+            # reported none, and an empty value is dropped rather than guessed
+            # at.
+            if output.finish_reason:
+                invocation.finish_reasons = [output.finish_reason]
+            if handler.should_capture_content():
+                invocation.output_messages = [output]
+            return output_message
 
     return wrapper
 
@@ -363,7 +365,7 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
             self._accumulate_tool_call(delta)
 
     def _output_message(self) -> OutputMessage | None:
-        parts: list[Any] = []
+        parts: list[MessagePart] = []
         content = "".join(self._self_content)
         if content:
             parts.append(Text(content=content))

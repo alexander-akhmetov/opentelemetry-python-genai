@@ -65,16 +65,6 @@ _LITELLM_PREFIX_TO_PROVIDER: dict[str, str] = {
 _LITELLM_CLASS_NAMES = frozenset({"LiteLLMModel", "LiteLLMRouterModel"})
 
 
-def _class_names(instance: Any) -> list[str]:
-    """The instance's class names, most derived first.
-
-    Only the classes that define ``generate`` are patched, so an instrumented
-    model can be a user subclass of one of them. Matching the exact class name
-    alone would report ``unknown`` for every such subclass.
-    """
-    return [cls.__name__ for cls in type(instance).__mro__]
-
-
 def _provider_from_litellm(instance: Any) -> str | None:
     model_id = getattr(instance, "model_id", None)
     if not isinstance(model_id, str) or "/" not in model_id:
@@ -133,7 +123,11 @@ def resolve_server_address_port(
 
 def resolve_provider(instance: Any) -> str:
     """Return the ``gen_ai.provider.name`` value for a smolagents model instance."""
-    class_names = _class_names(instance)
+    # The instance's class names, most derived first. Only the classes that
+    # define ``generate`` are patched, so an instrumented model can be a user
+    # subclass of one of them. Matching the exact class name alone would report
+    # ``unknown`` for every such subclass.
+    class_names = [cls.__name__ for cls in type(instance).__mro__]
 
     if not _LITELLM_CLASS_NAMES.isdisjoint(class_names):
         provider = _provider_from_litellm(instance)

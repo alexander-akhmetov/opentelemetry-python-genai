@@ -125,10 +125,8 @@ class SmolagentsInstrumentor(BaseInstrumentor):
             or load_completion_hook(),
         )
 
-        wrapped_generate_classes: list[type] = []
-        self._wrapped_generate_classes = wrapped_generate_classes
-        wrapped_generate_stream_classes: list[type] = []
-        self._wrapped_generate_stream_classes = wrapped_generate_stream_classes
+        self._wrapped_generate_classes = []
+        self._wrapped_generate_stream_classes = []
         try:
             for model_cls in _model_classes_defining(smolagents, "generate"):
                 wrap_function_wrapper(
@@ -136,7 +134,7 @@ class SmolagentsInstrumentor(BaseInstrumentor):
                     "generate",
                     model_generate(handler),
                 )
-                wrapped_generate_classes.append(model_cls)
+                self._wrapped_generate_classes.append(model_cls)
 
             for model_cls in _model_classes_defining(
                 smolagents, "generate_stream"
@@ -146,7 +144,7 @@ class SmolagentsInstrumentor(BaseInstrumentor):
                     "generate_stream",
                     model_generate_stream(handler),
                 )
-                wrapped_generate_stream_classes.append(model_cls)
+                self._wrapped_generate_stream_classes.append(model_cls)
         except Exception:
             # BaseInstrumentor.instrument() doesn't mark the instrumentor as
             # instrumented when _instrument raises, so uninstrument() would
