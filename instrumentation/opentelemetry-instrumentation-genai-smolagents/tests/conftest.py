@@ -5,69 +5,16 @@
 
 from __future__ import annotations
 
-import os
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from opentelemetry.instrumentation.genai.smolagents import (
     SmolagentsInstrumentor,
 )
 from opentelemetry.test_util_genai.instrumentor import instrument
-from opentelemetry.test_util_genai.vcr import (
-    scrub_response_headers_overwrite,
-)
 
-pytest_plugins = [
-    "opentelemetry.test_util_genai.fixtures",
-    "opentelemetry.test_util_genai.vcr",
-]
-
-
-@pytest.fixture(scope="module")
-def vcr_config():
-    return {
-        "filter_headers": [
-            ("cookie", "test_cookie"),
-            ("authorization", "Bearer test_openai_api_key"),
-            ("x-api-key", "test_anthropic_api_key"),
-            ("openai-organization", "test_openai_org_id"),
-            ("openai-project", "test_openai_project_id"),
-        ],
-        "decode_compressed_response": True,
-        "before_record_response": scrub_response_headers_overwrite(
-            {
-                "openai-organization": "test_openai_org_id",
-                "openai-project": "test_openai_project_id",
-                "Set-Cookie": "test_set_cookie",
-            }
-        ),
-    }
-
-
-@pytest.fixture
-def litellm_local_cost_map():
-    """Use LiteLLM's bundled model-cost map so it doesn't fetch prices over the
-    network during cassette playback."""
-    previous = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP")
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
-        else:
-            os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = previous
-
-
-@pytest.fixture
-def patch_tiktoken_encoding():
-    """Patch ``tiktoken.get_encoding`` so LiteLLM doesn't download an encoding."""
-    with patch("tiktoken.get_encoding") as mock_get_encoding:
-        mock_encoding = MagicMock()
-        mock_encoding.encode.return_value = [1, 2, 3]
-        mock_get_encoding.return_value = mock_encoding
-        yield
+# No VCR plugin: the instrumented model classes run inference in this process,
+# so there is no HTTP traffic to record.
+pytest_plugins = ["opentelemetry.test_util_genai.fixtures"]
 
 
 @pytest.fixture

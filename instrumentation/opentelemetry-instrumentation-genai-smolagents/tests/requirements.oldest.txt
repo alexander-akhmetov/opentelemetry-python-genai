@@ -21,13 +21,8 @@
 # pyproject.toml is the single source of truth. The OpenTelemetry SDK and test utilities
 # come transitively from opentelemetry-test-util-genai.
 #
-# openai and litellm are the model backends the VCR model tests instantiate. They are
-# test-only (not declared in pyproject.toml) and smolagents does not pull them in through
-# the instruments extra, so pin them here to the versions smolagents 1.24.0 declares in its
-# own openai/litellm extras. litellm resolves to its floor; openai resolves to 1.61.0
-# rather than 1.58.1 because litellm 1.60.2 itself requires openai>=1.61.0.
-openai>=1.58.1
-litellm>=1.60.2
+# The instrumented model classes run inference in this process and the tests stub their
+# runtimes, so there is no model backend to pin here.
 
 # The declared opentelemetry-util-genai floor carries the streaming metrics and the
 # gen_ai.request.stream attribute, which are not in a published release yet.

@@ -4,11 +4,12 @@
 """wrapt wrapper factories for smolagents instrumentation.
 
 Each factory takes the shared :class:`TelemetryHandler` and returns a wrapper
-suitable for :func:`wrapt.wrap_function_wrapper`:
+suitable for :func:`wrapt.wrap_function_wrapper`, applied to the in-process
+model classes only (see ``_IN_PROCESS_MODEL_CLASSES``):
 
-- :func:`model_generate` wraps each defining ``Model.generate`` -> ``chat`` span.
-- :func:`model_generate_stream` wraps each defining ``Model.generate_stream``
-  -> ``chat`` span, held open until the stream is drained.
+- :func:`model_generate` wraps ``generate`` -> ``chat`` span.
+- :func:`model_generate_stream` wraps ``generate_stream`` -> ``chat`` span, held
+  open until the stream is drained.
 
 Original library exceptions are always re-raised unmodified; telemetry is
 finalized via ``invocation.stop()`` / ``invocation.fail(exc)``.
@@ -17,10 +18,9 @@ finalized via ``invocation.stop()`` / ``invocation.fail(exc)``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Generator, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Generator, Mapping
 from inspect import signature
-from typing import Any, Callable
+from typing import Any
 
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
@@ -28,22 +28,14 @@ from opentelemetry.semconv._incubating.attributes import (
 from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.invocation import InferenceInvocation
 from opentelemetry.util.genai.stream import SyncStreamWrapper
-from opentelemetry.util.genai.types import (
-    MessagePart,
-    OutputMessage,
-    Text,
-    ToolCallRequest,
-)
+from opentelemetry.util.genai.types import OutputMessage, Text
 
 from ._messages import (
-    finish_reason,
-    response_id,
-    response_model_name,
     to_input_messages,
     to_output_message,
     to_tool_definitions,
 )
-from .provider import resolve_provider, resolve_server_address_port
+from .provider import resolve_provider
 
 _logger = logging.getLogger(__name__)
 
@@ -96,31 +88,13 @@ def _coerce_int(value: Any) -> int | None:
 def _remove_parameter_sentinel() -> Any:
     """Return smolagents' ``REMOVE_PARAMETER`` sentinel, or ``None`` if absent."""
     try:
-        from smolagents.models import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+        from smolagents.models import (  # pylint: disable=import-outside-toplevel
             REMOVE_PARAMETER,
         )
     except ImportError:
         _logger.debug("smolagents.models.REMOVE_PARAMETER is unavailable")
         return None
     return REMOVE_PARAMETER
-
-
-# Model classes that never forward ``stop_sequences``, whatever
-# ``supports_stop_parameter`` answers. ``AmazonBedrockModel`` overrides
-# ``_prepare_completion_kwargs`` and calls the base with a hardcoded
-# ``stop_sequences=None`` (``models.py``), so its ``converse`` request carries
-# no stop sequences at all. ``_forwards_stop_sequences`` matches these names
-# along the MRO, so subclasses are covered too.
-_MODELS_DROPPING_STOP_SEQUENCES = frozenset({"AmazonBedrockModel"})
-
-
-def _forwards_stop_sequences(instance: Any) -> bool:
-    if any(
-        cls.__name__ in _MODELS_DROPPING_STOP_SEQUENCES
-        for cls in type(instance).__mro__
-    ):
-        return False
-    return bool(getattr(instance, "supports_stop_parameter", False))
 
 
 def _merged_request_kwargs(
@@ -138,7 +112,9 @@ def _merged_request_kwargs(
     """
     merged: dict[str, Any] = {}
     stop_sequences = bound.get("stop_sequences")
-    if stop_sequences is not None and _forwards_stop_sequences(instance):
+    if stop_sequences is not None and getattr(
+        instance, "supports_stop_parameter", False
+    ):
         merged["stop"] = stop_sequences
     response_format = bound.get("response_format")
     if response_format is not None:
@@ -233,8 +209,8 @@ def _apply_token_usage(
 ) -> None:
     # ChatMessage.token_usage is the only source: the per-model
     # last_input_token_count / last_output_token_count counters were removed
-    # before the oldest supported smolagents. It is None for the local runtimes
-    # (TransformersModel, VLLMModel, MLXModel), which report no usage.
+    # before the oldest supported smolagents. The in-process runtimes count the
+    # prompt and generated tokens themselves and report them here.
     token_usage = getattr(output_message, "token_usage", None)
     if token_usage is None:
         return
@@ -251,15 +227,14 @@ def _start_inference(
 ) -> InferenceInvocation:
     """Start the ``chat`` span and record the request.
 
-    ``generate`` and ``generate_stream`` take the same parameters.
+    ``generate`` and ``generate_stream`` take the same parameters. An in-process
+    runtime listens on no socket, so the span carries no ``server.address`` or
+    ``server.port``.
     """
     provider = resolve_provider(instance)
-    server_address, server_port = resolve_server_address_port(instance)
     invocation = handler.inference(
         provider,
         request_model=getattr(instance, "model_id", None),
-        server_address=server_address,
-        server_port=server_port,
     )
     bound = _bind_arguments(wrapped, args, kwargs)
     _apply_request_parameters(invocation, instance, bound)
@@ -272,7 +247,13 @@ def _start_inference(
 
 
 def model_generate(handler: TelemetryHandler) -> _Wrapper:
-    """Wrap a defining ``Model.generate`` to emit a ``chat`` span."""
+    """Wrap a defining ``Model.generate`` to emit a ``chat`` span.
+
+    An in-process runtime returns the generated text, the token counts it made
+    itself, and no response envelope, so the span carries no
+    ``gen_ai.response.id``, ``gen_ai.response.model`` or
+    ``gen_ai.response.finish_reasons``.
+    """
 
     def wrapper(
         wrapped: Callable[..., Any],
@@ -284,12 +265,6 @@ def model_generate(handler: TelemetryHandler) -> _Wrapper:
         with invocation:
             output_message = wrapped(*args, **kwargs)
             _apply_token_usage(invocation, output_message)
-            invocation.response_model_name = response_model_name(
-                output_message
-            )
-            invocation.response_id = response_id(output_message)
-            if reason := finish_reason(output_message):
-                invocation.finish_reasons = [reason]
             if handler.should_capture_content():
                 invocation.output_messages = [
                     to_output_message(output_message)
@@ -299,20 +274,15 @@ def model_generate(handler: TelemetryHandler) -> _Wrapper:
     return wrapper
 
 
-@dataclass
-class _StreamedToolCall:
-    """A tool call assembled from stream deltas."""
-
-    id: str | None = None
-    name: str = ""
-    arguments: str = ""
-
-
 class _ModelStreamWrapper(SyncStreamWrapper[Any]):
     """Keep the ``chat`` span open until the delta stream is drained.
 
     Passing the invocation to ``super().__init__()`` turns on
     ``gen_ai.request.stream`` and the per-chunk timing metrics.
+
+    ``TransformersModel`` is the only in-process runtime with a
+    ``generate_stream``. Its deltas carry the generated text and per-delta token
+    counts, and never any tool calls.
     """
 
     def __init__(
@@ -325,33 +295,9 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
         self._self_inference = invocation
         self._self_capture_content = handler.should_capture_content()
         self._self_content: list[str] = []
-        self._self_tool_calls: dict[int, _StreamedToolCall] = {}
         self._self_input_tokens = 0
         self._self_output_tokens = 0
         self._self_saw_token_usage = False
-
-    def _accumulate_tool_call(self, delta: Any) -> None:
-        index = getattr(delta, "index", None)
-        if not isinstance(index, int):
-            # agglomerate_stream_deltas raises here; telemetry must not.
-            _logger.debug("Dropping a tool call delta that carries no index")
-            return
-        tool_call = self._self_tool_calls.setdefault(
-            index, _StreamedToolCall()
-        )
-        if not self._self_capture_content:
-            # The finish reason only needs a tool call to have happened; its
-            # name and arguments are content.
-            return
-        if delta.id:
-            tool_call.id = delta.id
-        function = getattr(delta, "function", None)
-        if function is None:
-            return
-        if function.name:
-            tool_call.name = function.name
-        if function.arguments:
-            tool_call.arguments += function.arguments
 
     def _process_chunk(self, chunk: Any) -> None:
         content = getattr(chunk, "content", None)
@@ -364,31 +310,16 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
             self._self_saw_token_usage = True
             self._self_input_tokens += token_usage.input_tokens
             self._self_output_tokens += token_usage.output_tokens
-        for delta in getattr(chunk, "tool_calls", None) or []:
-            self._accumulate_tool_call(delta)
 
     def _output_message(self) -> OutputMessage | None:
-        parts: list[MessagePart] = []
         content = "".join(self._self_content)
-        if content:
-            parts.append(Text(content=content))
-        parts.extend(
-            ToolCallRequest(
-                name=tool_call.name,
-                id=tool_call.id,
-                arguments=tool_call.arguments or None,
-            )
-            for tool_call in self._self_tool_calls.values()
-        )
-        if not parts:
+        if not content:
             # Closed before it was drained, so there is no response to report.
             return None
-        # Deltas carry no finish reason, so tool calls are the only evidence.
-        # Defaulting to "stop" would hide a generation cut short by a token
-        # limit.
-        finish_reason = "tool_calls" if self._self_tool_calls else ""
+        # Deltas carry no finish reason, and defaulting to "stop" would hide a
+        # generation cut short by a token limit.
         return OutputMessage(
-            role="assistant", parts=parts, finish_reason=finish_reason
+            role="assistant", parts=[Text(content=content)], finish_reason=""
         )
 
     def _finalize(self, error: BaseException | None = None) -> None:
@@ -396,8 +327,6 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
         if self._self_saw_token_usage:
             invocation.input_tokens = self._self_input_tokens
             invocation.output_tokens = self._self_output_tokens
-        if self._self_tool_calls:
-            invocation.finish_reasons = ["tool_calls"]
         if self._self_capture_content:
             output = self._output_message()
             if output is not None:
@@ -429,13 +358,7 @@ def model_generate_stream(handler: TelemetryHandler) -> _Wrapper:
         kwargs: dict[str, Any],
     ) -> Any:
         invocation = _start_inference(handler, wrapped, instance, args, kwargs)
-
-        try:
-            stream = wrapped(*args, **kwargs)
-        except Exception as error:  # pylint: disable=broad-except
-            invocation.fail(error)
-            raise
-
+        stream = wrapped(*args, **kwargs)
         return _ModelStreamWrapper(stream, invocation, handler)
 
     return wrapper

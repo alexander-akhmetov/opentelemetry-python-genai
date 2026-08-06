@@ -7,31 +7,56 @@ OpenTelemetry smolagents Instrumentation
    :target: https://pypi.org/project/opentelemetry-instrumentation-genai-smolagents/
 
 This library provides OpenTelemetry instrumentation for `smolagents
-<https://github.com/huggingface/smolagents>`_. It wraps the smolagents model
-classes and emits a GenAI semantic-convention ``chat`` span and the matching
-metrics through ``opentelemetry-util-genai``.
+<https://github.com/huggingface/smolagents>`_. It wraps the model classes that
+run inference in your own process and emits a GenAI semantic-convention ``chat``
+span and the matching metrics through ``opentelemetry-util-genai``:
+
+* ``TransformersModel``
+* ``VLLMModel``
+* ``MLXModel``
+
+The API-backed model classes are not instrumented here. Each one calls a client
+library that carries its own instrumentation. Emitting a span at the smolagents
+layer as well would produce two ``chat`` spans for one model call, and would
+count the token-usage and duration metrics twice. Install the instrumentation
+for the client library instead:
+
+.. list-table::
+   :header-rows: 1
+
+   * - smolagents model class
+     - Instrument this instead
+   * - ``OpenAIModel``, ``AzureOpenAIModel``
+     - `opentelemetry-instrumentation-genai-openai
+       <https://pypi.org/project/opentelemetry-instrumentation-genai-openai/>`_
+   * - ``AmazonBedrockModel``
+     - `opentelemetry-instrumentation-botocore
+       <https://pypi.org/project/opentelemetry-instrumentation-botocore/>`_
+   * - ``InferenceClientModel``, ``LiteLLMModel``, ``LiteLLMRouterModel``
+     - the instrumentation or built-in telemetry of the client library the model
+       calls (``huggingface_hub``, ``litellm``)
 
 Agent runs (``invoke_agent``) and tool calls (``execute_tool``) are not
 instrumented yet. A model call made inside an agent run still gets a ``chat``
 span, but no agent span sits above it.
 
-A streamed model call, whether it comes from ``stream_outputs=True`` on an agent
-or from calling ``Model.generate_stream`` directly, gets a ``chat`` span that
-stays open until the caller drains the deltas. The span carries
-``gen_ai.request.stream``, and the call also records the
+``TransformersModel`` is the only instrumented class with a ``generate_stream``.
+A streamed call gets a ``chat`` span that stays open until the caller drains the
+deltas. This covers both ``stream_outputs=True`` on an agent and a direct
+``generate_stream`` call. The span carries ``gen_ai.request.stream``, and the
+call also records the
 ``gen_ai.client.operation.time_to_first_chunk`` and
 ``gen_ai.client.operation.time_per_output_chunk`` metrics.
 
 Known gaps:
 
-* The instrumentation patches ``generate`` and ``generate_stream`` on the model
-  classes that smolagents ships. A subclass that inherits either method is
-  instrumented. A subclass that overrides one is not: the override shadows the
-  patched method, so the call produces no ``chat`` span.
-* A streamed ``chat`` span reports no ``gen_ai.response.id`` and no
-  ``gen_ai.response.model``, because a smolagents stream delta carries neither.
-  The span reports ``gen_ai.response.finish_reasons`` only when the model
-  requested tool calls, which is the one stop reason the deltas make visible.
+* A subclass that inherits ``generate`` or ``generate_stream`` from one of the
+  three classes above is instrumented. A subclass that overrides one is not: the
+  override shadows the patched method, so the call produces no ``chat`` span.
+* A ``chat`` span reports no ``gen_ai.response.id``, no
+  ``gen_ai.response.model``, no ``gen_ai.response.finish_reasons`` and no
+  ``server.address``. A runtime in this process returns the generated text and
+  the token counts, nothing more. It also listens on no socket.
 
 Installation
 ------------
@@ -48,11 +73,11 @@ Usage
     from opentelemetry.instrumentation.genai.smolagents import (
         SmolagentsInstrumentor,
     )
-    from smolagents import InferenceClientModel
+    from smolagents import TransformersModel
 
     SmolagentsInstrumentor().instrument()
 
-    model = InferenceClientModel()
+    model = TransformersModel(model_id="HuggingFaceTB/SmolLM2-135M-Instruct")
     model.generate([{"role": "user", "content": "How many seconds are in a week?"}])
 
 Configuration

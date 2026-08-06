@@ -1,15 +1,25 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared helpers, tools, and model stubs for smolagents instrumentation tests."""
+"""Shared helpers, tools, and model stubs for smolagents instrumentation tests.
+
+Only the in-process model classes are instrumented, and none of them can be
+recorded with VCR: they run inference in the current process instead of calling
+a provider over HTTP. Each factory here bypasses ``__init__`` (which would load
+gigabytes of weights) and stubs the runtime pieces the real ``generate`` drives,
+so the code under test is smolagents' own ``generate`` and the wrapper around
+it.
+"""
 
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
-from smolagents import OpenAIModel, Tool
+import pytest
+from smolagents import Tool
 
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.semconv._incubating.attributes import (
@@ -32,154 +42,153 @@ class GetWeatherTool(Tool):
         return "sunny"
 
 
-def openai_model() -> OpenAIModel:
-    return OpenAIModel(
-        model_id="gpt-4o",
-        api_key="test_openai_api_key",
-        api_base="https://api.openai.com/v1",
-    )
+# The in-process runtimes flatten a message's content as text, so the content
+# has to be a list of parts rather than a bare string.
+MESSAGES: list[dict[str, Any]] = [
+    {
+        "role": "user",
+        "content": [{"type": "text", "text": "Where is the Louvre?"}],
+    }
+]
 
 
-def stub_openai_client(
-    content: str, finish_reason: str = "stop", error: Exception | None = None
-) -> Any:
-    """An object shaped like the bits of ``openai.OpenAI`` that ``generate`` uses.
+class _PromptTokens:
+    """The part of a torch tensor that ``TransformersModel.generate`` uses.
 
-    Building a real ``ChatCompletion`` keeps the response shape honest (the
-    wrapper reads ``raw.model``, ``raw.id``, and ``raw.choices[0].finish_reason``)
-    without needing a cassette for a deployment we can't record against.
+    It reads ``inputs.shape[1]`` for the prompt length and slices the generated
+    tail out of the model's output with ``out[0, prompt_length:]``. Moving to a
+    device and the ``input_ids`` unwrap are part of the same path.
     """
-    from openai.types.chat import (  # noqa: PLC0415
-        ChatCompletion,
-        ChatCompletionMessage,
-    )
-    from openai.types.chat.chat_completion import Choice  # noqa: PLC0415
-    from openai.types.completion_usage import CompletionUsage  # noqa: PLC0415
 
-    completion = ChatCompletion(
-        id="chatcmpl-stub",
-        model="gpt-4o-2024-08-06",
-        object="chat.completion",
-        created=0,
-        choices=[
-            Choice(
-                index=0,
-                finish_reason=finish_reason,
-                message=ChatCompletionMessage(
-                    role="assistant", content=content
-                ),
-            )
-        ],
-        usage=CompletionUsage(
-            prompt_tokens=3, completion_tokens=1, total_tokens=4
-        ),
-    )
+    def __init__(self, ids: list[int]) -> None:
+        self.ids = ids
 
-    def create(**_: Any) -> ChatCompletion:
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (1, len(self.ids))
+
+    def to(self, _device: Any) -> _PromptTokens:
+        return self
+
+    def __getitem__(self, key: Any) -> list[int]:
+        _row, columns = key
+        return self.ids[columns]
+
+
+def transformers_model(
+    prompt_ids: list[int] | None = None,
+    generated_ids: list[int] | None = None,
+    text: str = "In Paris",
+    error: Exception | None = None,
+    stream_chunks: list[str] | None = None,
+    **model_kwargs: Any,
+) -> Any:
+    """A ``TransformersModel`` whose tokenizer and weights are stubbed.
+
+    ``generate`` builds the prompt through ``self.tokenizer
+    .apply_chat_template``, counts its tokens, calls ``self.model.generate`` and
+    decodes the tail. ``generate_stream`` instead runs ``self.model.generate``
+    on a thread and iterates ``self.streamer``, so the stubbed streamer is what
+    yields the deltas.
+    """
+    from smolagents.models import TransformersModel
+
+    prompt_ids = prompt_ids or [1, 2, 3]
+    generated_ids = generated_ids or [4, 5]
+
+    def generate(**_: Any) -> Any:
         if error is not None:
             raise error
-        return completion
+        return _PromptTokens(prompt_ids + generated_ids)
 
-    return SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    model = object.__new__(TransformersModel)
+    model.model_id = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    model.kwargs = dict(model_kwargs)
+    model.flatten_messages_as_text = True
+    model.apply_chat_template_kwargs = {}
+    model.tokenizer = SimpleNamespace(
+        apply_chat_template=lambda messages, **_: _PromptTokens(prompt_ids),
+        decode=lambda ids, **_: text,
     )
+    model.model = SimpleNamespace(device="cpu", generate=generate)
+    model.streamer = iter(stream_chunks or [])
+    return model
 
 
-def stub_streaming_openai_client(
-    chunks: list[Any], error: Exception | None = None
-) -> Any:
-    """An ``openai.OpenAI`` stand-in whose ``create`` returns a chunk stream.
+def mlx_model(text: str = "In Paris", **model_kwargs: Any) -> Any:
+    """An ``MLXModel`` whose ``mlx_lm`` pieces are stubbed.
 
-    ``OpenAIModel.generate_stream`` reads ``event.usage`` and
-    ``event.choices[0].delta``, so the chunks are real ``ChatCompletionChunk``
-    objects. ``error`` is raised after the chunks are yielded, which is how a
-    provider failure part-way through a stream reaches the caller.
+    ``MLXModel.generate`` imports nothing itself; it drives ``stream_generate``
+    over ``self.model`` and ``self.tokenizer``, which ``__init__`` loads from
+    ``mlx_lm``. Bypassing ``__init__`` is therefore enough to run the real
+    ``generate`` without the runtime installed.
     """
+    from smolagents.models import MLXModel
 
-    def create(**_: Any) -> Any:
-        def stream() -> Any:
-            yield from chunks
-            if error is not None:
-                raise error
-
-        return stream()
-
-    return SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    model = object.__new__(MLXModel)
+    model.model_id = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+    model.kwargs = dict(model_kwargs)
+    model.flatten_messages_as_text = True
+    model.apply_chat_template_kwargs = {}
+    model.model = object()
+    model.tokenizer = SimpleNamespace(
+        apply_chat_template=lambda messages, tools=None, **_: [1, 2, 3]
     )
+    # ``generate`` counts one output token per delta, so the deltas are the
+    # words of ``text`` and the output token count is the word count.
+    words = text.split(" ")
+    deltas = [
+        SimpleNamespace(text=word if index == 0 else f" {word}")
+        for index, word in enumerate(words)
+    ]
+    model.stream_generate = lambda *_, **__: iter(deltas)
+    return model
 
 
-def text_chunk(content: str) -> Any:
-    from openai.types.chat import ChatCompletionChunk  # noqa: PLC0415
-    from openai.types.chat.chat_completion_chunk import (  # noqa: PLC0415
-        Choice,
-        ChoiceDelta,
-    )
-
-    return ChatCompletionChunk(
-        id="chatcmpl-stub",
-        model="gpt-4o-2024-08-06",
-        object="chat.completion.chunk",
-        created=0,
-        choices=[Choice(index=0, delta=ChoiceDelta(content=content))],
-    )
-
-
-def tool_call_chunk(
-    index: int,
-    call_id: str | None = None,
-    name: str | None = None,
-    arguments: str | None = None,
+def vllm_model(
+    monkeypatch: pytest.MonkeyPatch,
+    text: str = "In Paris",
+    prompt_token_ids: list[int] | None = None,
+    output_token_ids: list[int] | None = None,
+    **model_kwargs: Any,
 ) -> Any:
-    from openai.types.chat import ChatCompletionChunk  # noqa: PLC0415
-    from openai.types.chat.chat_completion_chunk import (  # noqa: PLC0415
-        Choice,
-        ChoiceDelta,
-        ChoiceDeltaToolCall,
-        ChoiceDeltaToolCallFunction,
-    )
+    """A ``VLLMModel`` with ``vllm`` itself stubbed.
 
-    return ChatCompletionChunk(
-        id="chatcmpl-stub",
-        model="gpt-4o-2024-08-06",
-        object="chat.completion.chunk",
-        created=0,
-        choices=[
-            Choice(
-                index=0,
-                delta=ChoiceDelta(
-                    tool_calls=[
-                        ChoiceDeltaToolCall(
-                            index=index,
-                            id=call_id,
-                            type="function",
-                            function=ChoiceDeltaToolCallFunction(
-                                name=name, arguments=arguments
-                            ),
-                        )
-                    ]
-                ),
-            )
+    ``VLLMModel.generate`` imports ``SamplingParams`` and
+    ``StructuredOutputsParams`` from ``vllm`` when it runs, and no test env
+    installs vllm, so both modules are faked for the duration of the test.
+    Everything the wrapper reads still comes from the real ``generate``.
+    """
+    from smolagents.models import VLLMModel
+
+    def fake_params(**kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(**kwargs)
+
+    vllm = ModuleType("vllm")
+    sampling_params = ModuleType("vllm.sampling_params")
+    setattr(vllm, "SamplingParams", fake_params)
+    setattr(sampling_params, "StructuredOutputsParams", fake_params)
+    setattr(vllm, "sampling_params", sampling_params)
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling_params)
+
+    completion = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids or [1, 2, 3, 4],
+        outputs=[
+            SimpleNamespace(text=text, token_ids=output_token_ids or [5, 6])
         ],
     )
-
-
-def usage_chunk(prompt_tokens: int, completion_tokens: int) -> Any:
-    from openai.types.chat import ChatCompletionChunk  # noqa: PLC0415
-    from openai.types.completion_usage import CompletionUsage  # noqa: PLC0415
-
-    return ChatCompletionChunk(
-        id="chatcmpl-stub",
-        model="gpt-4o-2024-08-06",
-        object="chat.completion.chunk",
-        created=0,
-        choices=[],
-        usage=CompletionUsage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
+    model = object.__new__(VLLMModel)
+    model.model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    model.kwargs = dict(model_kwargs)
+    model.flatten_messages_as_text = True
+    model._is_vlm = False
+    model.apply_chat_template_kwargs = {}
+    model.tokenizer = SimpleNamespace(
+        apply_chat_template=lambda messages, **_: "prompt"
     )
+    model.model = SimpleNamespace(generate=lambda *_, **__: [completion])
+    return model
 
 
 def spans_by_operation(

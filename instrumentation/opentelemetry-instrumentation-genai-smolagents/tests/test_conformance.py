@@ -14,29 +14,27 @@ import pytest
 pytest.importorskip("opentelemetry.test.weaver_live_check")
 pytest.importorskip("opentelemetry.exporter.otlp.proto.grpc")
 
-from opentelemetry.test.weaver_live_check import WeaverLiveCheck  # noqa: E402
-from opentelemetry.test_util_genai.conformance import (  # noqa: E402
+from opentelemetry.test.weaver_live_check import WeaverLiveCheck
+from opentelemetry.test_util_genai.conformance import (
     Scenario,
     run_conformance,
 )
 
-from .conformance.inference import (  # noqa: E402
+from .conformance.inference import (
     ChatScenario,
-    ToolCallingScenario,
+    StreamedChatScenario,
+    ToolDefinitionsScenario,
 )
-from .conformance.multimodal import (  # noqa: E402
-    MultimodalScenario,
-    ReasoningScenario,
-)
+from .conformance.multimodal import MultimodalScenario
 
 
 @pytest.mark.parametrize(
     "scenario",
     [
         pytest.param(ChatScenario()),
-        pytest.param(ToolCallingScenario()),
+        pytest.param(StreamedChatScenario()),
+        pytest.param(ToolDefinitionsScenario()),
         pytest.param(MultimodalScenario()),
-        pytest.param(ReasoningScenario()),
     ],
     ids=lambda s: type(s).__name__,
 )

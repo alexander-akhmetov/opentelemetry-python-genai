@@ -16,7 +16,6 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
-from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
@@ -26,9 +25,7 @@ from opentelemetry.util.genai.types import (
     InputMessage,
     MessagePart,
     OutputMessage,
-    Reasoning,
     Text,
-    ToolCallRequest,
     ToolDefinition,
     Uri,
 )
@@ -48,16 +45,6 @@ _DATA_URL_PREFIX = "data:"
 _ROLE_MAP: dict[str, str] = {
     "tool-call": "assistant",
     "tool-response": "user",
-}
-
-# Amazon Bedrock reports the stop reason as ``stopReason`` using Anthropic's
-# vocabulary. Normalize it the way the anthropic instrumentation does
-# (``anthropic/utils.py``); anything unmapped passes through.
-_STOP_REASON_MAP: dict[str, str] = {
-    "end_turn": "stop",
-    "stop_sequence": "stop",
-    "max_tokens": "length",
-    "tool_use": "tool_calls",
 }
 
 
@@ -87,7 +74,7 @@ def _decode_base64_image(image: str) -> tuple[bytes, str] | None:
 
 def _encode_image_base64(image: Any) -> str | None:
     try:
-        from smolagents.utils import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+        from smolagents.utils import (  # pylint: disable=import-outside-toplevel
             encode_image_base64,
         )
     except ImportError:
@@ -183,90 +170,20 @@ def to_input_messages(messages: Any) -> list[InputMessage]:
     return result
 
 
-def _raw_value(raw: Any, key: str) -> Any:
-    """Read ``key`` off a provider response that may be an object or a dict.
-
-    ``ChatMessage.raw`` is whatever the provider handed back: an OpenAI-shaped
-    object for the API-backed models, and a dict for ``AmazonBedrockModel``
-    (the boto3 ``converse`` response) and the local runtimes.
-    """
-    if isinstance(raw, Mapping):
-        return raw.get(key)
-    return getattr(raw, key, None)
-
-
-def _first_choice(output_message: Any) -> Any:
-    choices = _raw_value(getattr(output_message, "raw", None), "choices")
-    if isinstance(choices, list) and choices:
-        return choices[0]
-    return None
-
-
-def _reasoning_from_raw(output_message: Any) -> str | None:
-    message = _raw_value(_first_choice(output_message), "message")
-    reasoning = _raw_value(message, "reasoning_content")
-    return reasoning if isinstance(reasoning, str) and reasoning else None
-
-
-def _tool_call_requests(output_message: Any) -> list[ToolCallRequest]:
-    # ChatMessage.__post_init__ coerces every entry into a
-    # ChatMessageToolCall, so the id/function/name/arguments are all present.
-    tool_calls = getattr(output_message, "tool_calls", None) or []
-    return [
-        ToolCallRequest(
-            name=tool_call.function.name,
-            id=tool_call.id,
-            arguments=tool_call.function.arguments,
-        )
-        for tool_call in tool_calls
-    ]
-
-
-def finish_reason(output_message: Any) -> str | None:
-    """Why the provider stopped generating, or ``None`` if it didn't say.
-
-    The local runtimes (``TransformersModel``, ``VLLMModel``, ``MLXModel``) put
-    ``{"out": ..., "completion_kwargs": ...}`` on ``raw`` and report no finish
-    reason at all. Defaulting those to ``"stop"`` would make a generation cut
-    short by ``max_new_tokens`` look like a natural stop. A response carrying
-    tool calls is the one case where the reason follows without guessing.
-    """
-    reason = _raw_value(_first_choice(output_message), "finish_reason")
-    if isinstance(reason, str) and reason:
-        return reason
-    raw = getattr(output_message, "raw", None)
-    stop_reason = _raw_value(raw, "stopReason")
-    if isinstance(stop_reason, str) and stop_reason:
-        return _STOP_REASON_MAP.get(stop_reason, stop_reason)
-    if getattr(output_message, "tool_calls", None):
-        return "tool_calls"
-    return None
-
-
 def to_output_message(output_message: Any) -> OutputMessage:
-    """Map a smolagents ``ChatMessage`` response to an ``OutputMessage``."""
+    """Map a smolagents ``ChatMessage`` response to an ``OutputMessage``.
+
+    The in-process runtimes return the generated text and nothing else: no tool
+    calls (the agent parses those out of the text afterwards), no reasoning
+    content, and no finish reason. ``OutputMessage`` requires
+    ``finish_reason``, and util-genai drops an empty value when it emits
+    ``gen_ai.response.finish_reasons``. Defaulting it to ``"stop"`` instead
+    would make a generation cut short by ``max_new_tokens`` look like a natural
+    stop.
+    """
     role = _unwrap_role(getattr(output_message, "role", None)) or "assistant"
     parts = _parts_from_content(getattr(output_message, "content", None))
-    if reasoning := _reasoning_from_raw(output_message):
-        parts.append(Reasoning(content=reasoning))
-    tool_call_requests = _tool_call_requests(output_message)
-    parts.extend(tool_call_requests)
-    # OutputMessage requires the field; util-genai drops an empty value when it
-    # emits gen_ai.response.finish_reasons.
-    reason = finish_reason(output_message)
-    return OutputMessage(role=role, parts=parts, finish_reason=reason or "")
-
-
-def response_id(output_message: Any) -> str | None:
-    """Extract ``gen_ai.response.id`` from the provider response on ``.raw``."""
-    value = _raw_value(getattr(output_message, "raw", None), "id")
-    return value if isinstance(value, str) and value else None
-
-
-def response_model_name(output_message: Any) -> str | None:
-    """Extract ``gen_ai.response.model`` from the provider response on ``.raw``."""
-    value = _raw_value(getattr(output_message, "raw", None), "model")
-    return value if isinstance(value, str) and value else None
+    return OutputMessage(role=role, parts=parts, finish_reason="")
 
 
 def _tool_parameters(tool: Any) -> dict[str, Any] | None:
@@ -278,7 +195,7 @@ def _tool_parameters(tool: Any) -> dict[str, Any] | None:
     schema the provider receives.
     """
     try:
-        from smolagents.models import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
+        from smolagents.models import (  # pylint: disable=import-outside-toplevel
             get_tool_json_schema,
         )
     except ImportError:

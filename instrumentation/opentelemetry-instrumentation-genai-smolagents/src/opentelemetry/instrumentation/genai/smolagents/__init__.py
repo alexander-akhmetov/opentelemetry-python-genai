@@ -7,8 +7,12 @@ OpenTelemetry smolagents Instrumentation
 
 Instrumentation for `smolagents <https://github.com/huggingface/smolagents>`_.
 
-Model calls are recorded as ``chat`` spans. Agent runs and tool calls are not
-instrumented yet.
+Calls to the in-process model classes (``TransformersModel``, ``VLLMModel`` and
+``MLXModel``) are recorded as ``chat`` spans. The API-backed model classes are
+not instrumented here: each one calls a client library that carries its own
+instrumentation, and emitting a span at this layer as well would duplicate the
+span and count the token-usage and duration metrics twice. Agent runs and tool
+calls are not instrumented yet.
 
 Usage
 -----
@@ -18,12 +22,14 @@ Usage
     from opentelemetry.instrumentation.genai.smolagents import (
         SmolagentsInstrumentor,
     )
-    from smolagents import InferenceClientModel
+    from smolagents import TransformersModel
 
     SmolagentsInstrumentor().instrument()
 
-    model = InferenceClientModel()
-    model.generate([{"role": "user", "content": "How many seconds are in a week?"}])
+    model = TransformersModel(model_id="HuggingFaceTB/SmolLM2-135M-Instruct")
+    model.generate(
+        [{"role": "user", "content": "How many seconds are in a week?"}]
+    )
 
 Configuration
 -------------
@@ -45,7 +51,6 @@ API
 from __future__ import annotations
 
 from collections.abc import Collection
-from types import ModuleType
 from typing import Any
 
 from wrapt import wrap_function_wrapper
@@ -61,33 +66,40 @@ from .patch import model_generate, model_generate_stream
 __all__ = ["SmolagentsInstrumentor"]
 
 
-def _model_classes_defining(smolagents: ModuleType, method: str) -> list[type]:
-    """The exported model classes whose ``method`` gets wrapped.
+# The model classes that run inference in the current process. They call no
+# client library, so this instrumentation is the only place their model calls
+# can be observed.
+#
+# The API-backed classes are left out on purpose. Each one calls a client
+# library whose own instrumentation emits the ``chat`` span, so wrapping them
+# here as well would produce two spans for one model call and count the
+# token-usage and duration metrics twice. ``README.rst`` lists which
+# instrumentation covers which class.
+_IN_PROCESS_MODEL_CLASSES = ("MLXModel", "TransformersModel", "VLLMModel")
 
-    Only classes that define ``method`` in their own ``__dict__`` are patched,
-    so a class that inherits it (``AzureOpenAIModel``, ``LiteLLMRouterModel``)
-    isn't wrapped a second time and can't produce duplicate ``chat`` spans.
-    A user-defined subclass that overrides the method shadows the patched base
-    method and emits no ``chat`` span; that limitation is documented in
-    ``README.rst``.
 
-    Deduplicated by class object, because smolagents exports some classes under
-    two names (``OpenAIServerModel`` is ``OpenAIModel``) and wrapping the same
-    class twice would double every ``chat`` span.
+def _model_classes_defining(method: str) -> list[type]:
+    """The in-process model classes whose ``method`` gets wrapped.
+
+    Only classes that define ``method`` in their own ``__dict__`` are patched.
+    ``MLXModel`` and ``VLLMModel`` have no ``generate_stream``, and neither does
+    the base class, so wrapping it on them raises ``AttributeError``. The same
+    check keeps a method defined on a shared base from being wrapped once per
+    subclass.
+
+    A user-defined subclass that overrides the method shadows the patched one and
+    emits no ``chat`` span. ``README.rst`` documents that limitation.
     """
-    from smolagents.models import (  # noqa: PLC0415  # pylint: disable=import-outside-toplevel
-        Model,
+    from smolagents import (  # pylint: disable=import-outside-toplevel
+        models,
     )
 
-    classes: dict[type, None] = {}
-    for obj in vars(smolagents).values():
-        if (
-            isinstance(obj, type)
-            and issubclass(obj, Model)
-            and method in obj.__dict__
-        ):
-            classes.setdefault(obj, None)
-    return list(classes)
+    classes: list[type] = []
+    for name in _IN_PROCESS_MODEL_CLASSES:
+        model_cls = getattr(models, name, None)
+        if isinstance(model_cls, type) and method in model_cls.__dict__:
+            classes.append(model_cls)
+    return classes
 
 
 class SmolagentsInstrumentor(BaseInstrumentor):
@@ -115,8 +127,6 @@ class SmolagentsInstrumentor(BaseInstrumentor):
                 - logger_provider: LoggerProvider instance
                 - completion_hook: CompletionHook instance
         """
-        import smolagents  # pylint: disable=import-outside-toplevel  # noqa: PLC0415
-
         handler = TelemetryHandler(
             tracer_provider=kwargs.get("tracer_provider"),
             meter_provider=kwargs.get("meter_provider"),
@@ -128,7 +138,7 @@ class SmolagentsInstrumentor(BaseInstrumentor):
         self._wrapped_generate_classes = []
         self._wrapped_generate_stream_classes = []
         try:
-            for model_cls in _model_classes_defining(smolagents, "generate"):
+            for model_cls in _model_classes_defining("generate"):
                 wrap_function_wrapper(
                     model_cls,
                     "generate",
@@ -136,9 +146,7 @@ class SmolagentsInstrumentor(BaseInstrumentor):
                 )
                 self._wrapped_generate_classes.append(model_cls)
 
-            for model_cls in _model_classes_defining(
-                smolagents, "generate_stream"
-            ):
+            for model_cls in _model_classes_defining("generate_stream"):
                 wrap_function_wrapper(
                     model_cls,
                     "generate_stream",

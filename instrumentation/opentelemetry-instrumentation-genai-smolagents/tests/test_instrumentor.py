@@ -20,7 +20,7 @@ from opentelemetry.test_util_genai.instrumentor import instrument
 from opentelemetry.util._importlib_metadata import entry_points
 from opentelemetry.util.genai.completion_hook import CompletionHook
 
-from .test_utils import openai_model, stub_openai_client
+from .test_utils import MESSAGES, transformers_model
 
 
 class RecordingHook(CompletionHook):
@@ -32,9 +32,7 @@ class RecordingHook(CompletionHook):
 
 
 def _generate_a_chat_span() -> None:
-    model = openai_model()
-    model.client = stub_openai_client("Bonjour")
-    model.generate(messages=[{"role": "user", "content": "Hi"}])
+    transformers_model().generate(messages=MESSAGES)
 
 
 def test_entrypoint_loads_instrumentor() -> None:
@@ -53,9 +51,9 @@ def test_instrumentation_dependencies() -> None:
 def test_instrument_uninstrument_restores_originals(
     tracer_provider, logger_provider, meter_provider
 ) -> None:
-    original_generate = smolagents.OpenAIModel.generate
-    original_base_generate = smolagents.Model.generate
-    original_generate_stream = smolagents.OpenAIModel.generate_stream
+    original_generate = smolagents.TransformersModel.generate
+    original_mlx_generate = smolagents.MLXModel.generate
+    original_generate_stream = smolagents.TransformersModel.generate_stream
 
     instrumentor = SmolagentsInstrumentor()
     instrumentor.instrument(
@@ -64,17 +62,56 @@ def test_instrument_uninstrument_restores_originals(
         meter_provider=meter_provider,
     )
 
-    assert smolagents.OpenAIModel.generate is not original_generate
-    assert smolagents.Model.generate is not original_base_generate
+    assert smolagents.TransformersModel.generate is not original_generate
+    assert smolagents.MLXModel.generate is not original_mlx_generate
     assert (
-        smolagents.OpenAIModel.generate_stream is not original_generate_stream
+        smolagents.TransformersModel.generate_stream
+        is not original_generate_stream
     )
 
     instrumentor.uninstrument()
 
-    assert smolagents.OpenAIModel.generate is original_generate
-    assert smolagents.Model.generate is original_base_generate
-    assert smolagents.OpenAIModel.generate_stream is original_generate_stream
+    assert smolagents.TransformersModel.generate is original_generate
+    assert smolagents.MLXModel.generate is original_mlx_generate
+    assert (
+        smolagents.TransformersModel.generate_stream
+        is original_generate_stream
+    )
+
+
+@pytest.mark.parametrize(
+    "model_class",
+    [
+        "Model",
+        "OpenAIModel",
+        "AzureOpenAIModel",
+        "AmazonBedrockModel",
+        "InferenceClientModel",
+        "LiteLLMModel",
+        "LiteLLMRouterModel",
+    ],
+)
+def test_api_backed_classes_are_left_alone(
+    tracer_provider, logger_provider, meter_provider, model_class: str
+) -> None:
+    # Each of these calls a client library that carries its own instrumentation,
+    # so patching them here would emit a second chat span for one model call and
+    # count the token-usage and duration metrics twice.
+    original = getattr(smolagents, model_class).__dict__.get("generate")
+
+    instrumentor = SmolagentsInstrumentor()
+    instrumentor.instrument(
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+    )
+    try:
+        assert (
+            getattr(smolagents, model_class).__dict__.get("generate")
+            is original
+        )
+    finally:
+        instrumentor.uninstrument()
 
 
 def test_uninstrument_through_a_new_constructor_call(
@@ -84,7 +121,7 @@ def test_uninstrument_through_a_new_constructor_call(
     # SmolagentsInstrumentor().instrument() / SmolagentsInstrumentor()
     # .uninstrument() form must restore everything even though the second
     # constructor call re-runs __init__ on the live instance.
-    original_generate = smolagents.OpenAIModel.generate
+    original_generate = smolagents.TransformersModel.generate
 
     SmolagentsInstrumentor().instrument(
         tracer_provider=tracer_provider,
@@ -93,43 +130,31 @@ def test_uninstrument_through_a_new_constructor_call(
     )
     SmolagentsInstrumentor().uninstrument()
 
-    assert smolagents.OpenAIModel.generate is original_generate
+    assert smolagents.TransformersModel.generate is original_generate
 
 
 @pytest.mark.parametrize("method", ["generate", "generate_stream"])
 def test_model_classes_defining(method: str) -> None:
-    classes = _model_classes_defining(smolagents, method)
+    classes = _model_classes_defining(method)
 
-    # Each class object appears once, whatever names it is exported under.
     assert len(classes) == len(set(classes))
     # Every entry owns the method, so no class is wrapped for one it only
     # inherits.
     for model_cls in classes:
         assert method in model_cls.__dict__
 
-    # The API-backed model classes define both; the classes that inherit them
-    # are reached through the base they inherit from.
-    assert {
-        smolagents.OpenAIModel,
-        smolagents.LiteLLMModel,
-        smolagents.InferenceClientModel,
-    } <= set(classes)
-    assert smolagents.AzureOpenAIModel not in classes
-    assert smolagents.LiteLLMRouterModel not in classes
 
-
-def test_only_generate_covers_the_base_class_and_bedrock() -> None:
-    # The base Model and AmazonBedrockModel define generate but no
-    # generate_stream, so streaming is patched on fewer classes.
-    generate = set(_model_classes_defining(smolagents, "generate"))
-    generate_stream = set(
-        _model_classes_defining(smolagents, "generate_stream")
-    )
-
-    assert {smolagents.Model, smolagents.AmazonBedrockModel} <= generate
-    assert generate_stream.isdisjoint(
-        {smolagents.Model, smolagents.AmazonBedrockModel}
-    )
+def test_only_transformers_defines_generate_stream() -> None:
+    # All three in-process runtimes define generate, but only TransformersModel
+    # streams.
+    assert set(_model_classes_defining("generate")) == {
+        smolagents.TransformersModel,
+        smolagents.VLLMModel,
+        smolagents.MLXModel,
+    }
+    assert _model_classes_defining("generate_stream") == [
+        smolagents.TransformersModel
+    ]
 
 
 def test_repeated_instrument_uninstrument(
@@ -137,7 +162,7 @@ def test_repeated_instrument_uninstrument(
 ) -> None:
     # BaseInstrumentor returns a per-class singleton, so the wrapped-class
     # bookkeeping has to survive being filled and drained more than once.
-    original_generate = smolagents.OpenAIModel.generate
+    original_generate = smolagents.TransformersModel.generate
 
     instrumentor = SmolagentsInstrumentor()
     for _ in range(2):
@@ -146,36 +171,36 @@ def test_repeated_instrument_uninstrument(
             logger_provider=logger_provider,
             meter_provider=meter_provider,
         )
-        assert smolagents.OpenAIModel.generate is not original_generate
+        assert smolagents.TransformersModel.generate is not original_generate
         instrumentor.uninstrument()
-        assert smolagents.OpenAIModel.generate is original_generate
+        assert smolagents.TransformersModel.generate is original_generate
 
 
 def test_uninstrument_without_instrument() -> None:
     # BaseInstrumentor.uninstrument() short-circuits, but _uninstrument() must
     # also be a no-op on unpatched attributes: the rollback in _instrument()
     # calls it after a partial patch.
-    original_generate = smolagents.OpenAIModel.generate
+    original_generate = smolagents.TransformersModel.generate
 
     SmolagentsInstrumentor().uninstrument()
     SmolagentsInstrumentor()._uninstrument()
 
-    assert smolagents.OpenAIModel.generate is original_generate
+    assert smolagents.TransformersModel.generate is original_generate
 
 
 def test_instrument_with_no_providers() -> None:
     # Without providers the handler falls back to the globals; instrumenting
     # must not require a caller to pass them.
-    original_generate = smolagents.OpenAIModel.generate
+    original_generate = smolagents.TransformersModel.generate
 
     instrumentor = SmolagentsInstrumentor()
     instrumentor.instrument()
     try:
-        assert smolagents.OpenAIModel.generate is not original_generate
+        assert smolagents.TransformersModel.generate is not original_generate
     finally:
         instrumentor.uninstrument()
 
-    assert smolagents.OpenAIModel.generate is original_generate
+    assert smolagents.TransformersModel.generate is original_generate
 
 
 def test_failed_instrument_rolls_back_partial_patches(
@@ -183,7 +208,7 @@ def test_failed_instrument_rolls_back_partial_patches(
 ) -> None:
     # A failure part-way through must leave no class patched, because
     # uninstrument() cannot clean up after a failed _instrument().
-    model_classes = _model_classes_defining(smolagents, "generate")
+    model_classes = _model_classes_defining("generate")
     assert len(model_classes) > 1, (
         "the rollback needs more than one class to patch"
     )
@@ -191,7 +216,7 @@ def test_failed_instrument_rolls_back_partial_patches(
         model_cls: model_cls.__dict__["generate"]
         for model_cls in model_classes
     }
-    stream_classes = _model_classes_defining(smolagents, "generate_stream")
+    stream_classes = _model_classes_defining("generate_stream")
     stream_originals = {
         model_cls: model_cls.__dict__["generate_stream"]
         for model_cls in stream_classes
@@ -225,13 +250,15 @@ def test_failed_instrument_rolls_back_partial_patches(
         assert model_cls.__dict__["generate_stream"] is original
 
 
-def test_inherited_generate_wrapped_only_on_defining_classes(
+def test_a_user_subclass_inherits_the_patched_generate(
     tracer_provider, logger_provider, meter_provider
 ) -> None:
-    # AzureOpenAIModel and LiteLLMRouterModel inherit generate; they must not be
-    # wrapped separately or they would emit duplicate chat spans.
-    assert "generate" not in smolagents.AzureOpenAIModel.__dict__
-    assert "generate" not in smolagents.LiteLLMRouterModel.__dict__
+    # A subclass that doesn't override generate is instrumented through the base
+    # it inherits it from, and must not be wrapped a second time.
+    class TenantMLXModel(smolagents.MLXModel):
+        pass
+
+    assert "generate" not in TenantMLXModel.__dict__
 
     instrumentor = SmolagentsInstrumentor()
     instrumentor.instrument(
@@ -242,10 +269,10 @@ def test_inherited_generate_wrapped_only_on_defining_classes(
     try:
         # wrapt returns a fresh bound wrapper per attribute access, so the
         # wrapper objects differ; the underlying wrapped function is shared,
-        # proving AzureOpenAIModel inherits the single wrapped generate.
+        # proving the subclass inherits the single wrapped generate.
         assert (
-            smolagents.AzureOpenAIModel.generate.__wrapped__
-            is smolagents.OpenAIModel.generate.__wrapped__
+            TenantMLXModel.generate.__wrapped__
+            is smolagents.MLXModel.generate.__wrapped__
         )
     finally:
         instrumentor.uninstrument()
