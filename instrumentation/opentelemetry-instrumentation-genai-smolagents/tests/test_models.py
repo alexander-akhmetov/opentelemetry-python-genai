@@ -146,6 +146,8 @@ def test_openai_model_no_content(
     assert isinstance(attr(span, GenAI.GEN_AI_USAGE_INPUT_TOKENS), int)
     assert attr(span, GenAI.GEN_AI_INPUT_MESSAGES) is None
     assert attr(span, GenAI.GEN_AI_OUTPUT_MESSAGES) is None
+    # The finish reason is metadata, so it survives without the content.
+    assert attr(span, GenAI.GEN_AI_RESPONSE_FINISH_REASONS) == ("stop",)
 
 
 def test_openai_model_image_url(
@@ -861,15 +863,23 @@ def test_generate_stream_no_content(
 ) -> None:
     model = openai_model()
     model.client = stub_streaming_openai_client(
-        [text_chunk("Bonjour"), usage_chunk(3, 2)]
+        [
+            text_chunk("Bonjour"),
+            tool_call_chunk(
+                0, call_id="call_1", name="get_weather", arguments="{}"
+            ),
+            usage_chunk(3, 2),
+        ]
     )
 
-    _drain_stream(model)
+    _drain_stream(model, tools_to_call_from=[GetWeatherTool()])
 
     (span,) = spans_by_operation(span_exporter.get_finished_spans(), "chat")
     assert attr(span, GenAI.GEN_AI_INPUT_MESSAGES) is None
     assert attr(span, GenAI.GEN_AI_OUTPUT_MESSAGES) is None
     assert attr(span, GenAI.GEN_AI_USAGE_OUTPUT_TOKENS) == 2
+    # A tool call still drives the finish reason without its name or arguments.
+    assert attr(span, GenAI.GEN_AI_RESPONSE_FINISH_REASONS) == ("tool_calls",)
 
 
 def test_event_only_content_capture(

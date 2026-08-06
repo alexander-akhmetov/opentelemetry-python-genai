@@ -36,6 +36,7 @@ from opentelemetry.util.genai.types import (
 )
 
 from ._messages import (
+    finish_reason,
     response_id,
     response_model_name,
     to_input_messages,
@@ -287,14 +288,12 @@ def model_generate(handler: TelemetryHandler) -> _Wrapper:
                 output_message
             )
             invocation.response_id = response_id(output_message)
-            output = to_output_message(output_message)
-            # to_output_message leaves finish_reason empty when the provider
-            # reported none, and an empty value is dropped rather than guessed
-            # at.
-            if output.finish_reason:
-                invocation.finish_reasons = [output.finish_reason]
+            if reason := finish_reason(output_message):
+                invocation.finish_reasons = [reason]
             if handler.should_capture_content():
-                invocation.output_messages = [output]
+                invocation.output_messages = [
+                    to_output_message(output_message)
+                ]
             return output_message
 
     return wrapper
@@ -324,7 +323,7 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
     ) -> None:
         super().__init__(stream, invocation=invocation)
         self._self_inference = invocation
-        self._self_handler = handler
+        self._self_capture_content = handler.should_capture_content()
         self._self_content: list[str] = []
         self._self_tool_calls: dict[int, _StreamedToolCall] = {}
         self._self_input_tokens = 0
@@ -340,6 +339,10 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
         tool_call = self._self_tool_calls.setdefault(
             index, _StreamedToolCall()
         )
+        if not self._self_capture_content:
+            # The finish reason only needs a tool call to have happened; its
+            # name and arguments are content.
+            return
         if delta.id:
             tool_call.id = delta.id
         function = getattr(delta, "function", None)
@@ -352,7 +355,7 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
 
     def _process_chunk(self, chunk: Any) -> None:
         content = getattr(chunk, "content", None)
-        if content:
+        if content and self._self_capture_content:
             self._self_content.append(content)
         token_usage = getattr(chunk, "token_usage", None)
         if token_usage is not None:
@@ -393,11 +396,11 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
         if self._self_saw_token_usage:
             invocation.input_tokens = self._self_input_tokens
             invocation.output_tokens = self._self_output_tokens
-        output = self._output_message()
-        if output is not None:
-            if output.finish_reason:
-                invocation.finish_reasons = [output.finish_reason]
-            if self._self_handler.should_capture_content():
+        if self._self_tool_calls:
+            invocation.finish_reasons = ["tool_calls"]
+        if self._self_capture_content:
+            output = self._output_message()
+            if output is not None:
                 invocation.output_messages = [output]
         if error is not None:
             invocation.fail(error)

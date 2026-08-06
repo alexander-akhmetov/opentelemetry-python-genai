@@ -222,7 +222,7 @@ def _tool_call_requests(output_message: Any) -> list[ToolCallRequest]:
     ]
 
 
-def _finish_reason(output_message: Any, has_tool_calls: bool) -> str | None:
+def finish_reason(output_message: Any) -> str | None:
     """Why the provider stopped generating, or ``None`` if it didn't say.
 
     The local runtimes (``TransformersModel``, ``VLLMModel``, ``MLXModel``) put
@@ -238,7 +238,9 @@ def _finish_reason(output_message: Any, has_tool_calls: bool) -> str | None:
     stop_reason = _raw_value(raw, "stopReason")
     if isinstance(stop_reason, str) and stop_reason:
         return _STOP_REASON_MAP.get(stop_reason, stop_reason)
-    return "tool_calls" if has_tool_calls else None
+    if getattr(output_message, "tool_calls", None):
+        return "tool_calls"
+    return None
 
 
 def to_output_message(output_message: Any) -> OutputMessage:
@@ -251,7 +253,7 @@ def to_output_message(output_message: Any) -> OutputMessage:
     parts.extend(tool_call_requests)
     # OutputMessage requires the field; util-genai drops an empty value when it
     # emits gen_ai.response.finish_reasons.
-    reason = _finish_reason(output_message, bool(tool_call_requests))
+    reason = finish_reason(output_message)
     return OutputMessage(role=role, parts=parts, finish_reason=reason or "")
 
 
