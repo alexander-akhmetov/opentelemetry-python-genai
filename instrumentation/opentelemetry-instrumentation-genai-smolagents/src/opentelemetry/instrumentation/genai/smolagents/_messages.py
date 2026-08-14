@@ -17,7 +17,7 @@ import base64
 import binascii
 import logging
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry.util.genai.types import (
     Blob,
@@ -29,6 +29,11 @@ from opentelemetry.util.genai.types import (
     ToolDefinition,
     Uri,
 )
+
+if TYPE_CHECKING:
+    from PIL.Image import Image
+    from smolagents.models import ChatMessage, MessageRole
+    from smolagents.tools import Tool
 
 _logger = logging.getLogger(__name__)
 
@@ -48,7 +53,7 @@ _ROLE_MAP: dict[str, str] = {
 }
 
 
-def _unwrap_role(role: Any) -> str | None:
+def _unwrap_role(role: MessageRole | str | None) -> str | None:
     if role is None:
         return None
     if isinstance(role, Enum):
@@ -72,7 +77,7 @@ def _decode_base64_image(image: str) -> tuple[bytes, str] | None:
         return None
 
 
-def _encode_image_base64(image: Any) -> str | None:
+def _encode_image_base64(image: Image) -> str | None:
     try:
         from smolagents.utils import (  # pylint: disable=import-outside-toplevel
             encode_image_base64,
@@ -92,7 +97,7 @@ def _encode_image_base64(image: Any) -> str | None:
     return encoded if isinstance(encoded, str) else None
 
 
-def _image_blob(image: Any) -> Blob | None:
+def _image_blob(image: Image | str) -> Blob | None:
     """Build a ``Blob`` part from a base64 string, data URL, or PIL image."""
     if isinstance(image, str):
         decoded = _decode_base64_image(image)
@@ -122,7 +127,9 @@ def _image_part_from_element(element: dict[str, Any]) -> Uri | Blob | None:
     return None
 
 
-def _parts_from_content(content: Any) -> list[MessagePart]:
+def _parts_from_content(
+    content: str | list[dict[str, Any]] | None,
+) -> list[MessagePart]:
     parts: list[MessagePart] = []
     if isinstance(content, str):
         parts.append(Text(content=content))
@@ -148,13 +155,19 @@ def _parts_from_content(content: Any) -> list[MessagePart]:
     return parts
 
 
-def _get_role_and_content(message: Any) -> tuple[Any, Any]:
+def _get_role_and_content(
+    message: ChatMessage | dict[str, Any],
+) -> tuple[MessageRole | str | None, str | list[dict[str, Any]] | None]:
+    # smolagents reads a message the same way: a dict goes through
+    # ChatMessage.from_dict, anything else has its attributes read directly.
     if isinstance(message, dict):
         return message.get("role"), message.get("content")
-    return getattr(message, "role", None), getattr(message, "content", None)
+    return message.role, message.content
 
 
-def to_input_messages(messages: Any) -> list[InputMessage]:
+def to_input_messages(
+    messages: list[ChatMessage | dict[str, Any]] | None,
+) -> list[InputMessage]:
     """Map smolagents ``generate`` input messages to ``InputMessage`` objects."""
     result: list[InputMessage] = []
     if not isinstance(messages, list):
@@ -170,7 +183,7 @@ def to_input_messages(messages: Any) -> list[InputMessage]:
     return result
 
 
-def to_output_message(output_message: Any) -> OutputMessage:
+def to_output_message(output_message: ChatMessage) -> OutputMessage:
     """Map a smolagents ``ChatMessage`` response to an ``OutputMessage``.
 
     The in-process runtimes return the generated text and nothing else: no tool
@@ -181,12 +194,12 @@ def to_output_message(output_message: Any) -> OutputMessage:
     would make a generation cut short by ``max_new_tokens`` look like a natural
     stop.
     """
-    role = _unwrap_role(getattr(output_message, "role", None)) or "assistant"
-    parts = _parts_from_content(getattr(output_message, "content", None))
+    role = _unwrap_role(output_message.role) or "assistant"
+    parts = _parts_from_content(output_message.content)
     return OutputMessage(role=role, parts=parts, finish_reason="")
 
 
-def _tool_parameters(tool: Any) -> dict[str, Any] | None:
+def _tool_parameters(tool: Tool) -> dict[str, Any] | None:
     """Return the JSON Schema ``parameters`` object for a smolagents tool.
 
     A tool's ``inputs`` map is not a JSON Schema on its own: smolagents wraps it
@@ -207,27 +220,29 @@ def _tool_parameters(tool: Any) -> dict[str, Any] | None:
     except Exception:  # pylint: disable=broad-except
         _logger.debug(
             "Failed to build a JSON Schema for tool %s",
-            getattr(tool, "name", None),
+            tool.name,
             exc_info=True,
         )
         return None
     return parameters if isinstance(parameters, dict) else None
 
 
-def to_tool_definitions(tools: Any) -> list[ToolDefinition] | None:
-    """Map smolagents tool objects to function tool definitions."""
-    if not isinstance(tools, list) or not tools:
+def to_tool_definitions(
+    tools: list[Tool] | None,
+) -> list[ToolDefinition] | None:
+    """Map smolagents tool objects to function tool definitions.
+
+    ``Tool.validate_arguments`` runs on every instantiation and requires a
+    non-empty ``name`` and a ``description``, so both are read directly.
+    """
+    if not tools:
         return None
-    definitions: list[ToolDefinition] = []
-    for tool in tools:
-        name = getattr(tool, "name", None)
-        if not name:
-            continue
-        definitions.append(
-            FunctionToolDefinition(
-                name=name,
-                description=getattr(tool, "description", None),
-                parameters=_tool_parameters(tool),
-            )
+    definitions: list[ToolDefinition] = [
+        FunctionToolDefinition(
+            name=tool.name,
+            description=tool.description,
+            parameters=_tool_parameters(tool),
         )
-    return definitions or None
+        for tool in tools
+    ]
+    return definitions

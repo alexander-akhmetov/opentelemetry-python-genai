@@ -15,7 +15,6 @@ from __future__ import annotations
 import inspect
 import json
 from collections.abc import Generator
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -492,7 +491,7 @@ def test_response_format_precedence(
         for key, value in model_kwargs.items()
     }
     merged = _merged_request_kwargs(
-        SimpleNamespace(kwargs=model_kwargs),
+        transformers_model(**model_kwargs),
         {"response_format": response_format},
     )
     assert _output_type(merged) == expected

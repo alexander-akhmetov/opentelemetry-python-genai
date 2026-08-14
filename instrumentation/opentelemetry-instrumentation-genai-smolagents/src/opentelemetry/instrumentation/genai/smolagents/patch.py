@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Generator, Mapping
 from inspect import signature
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
@@ -37,10 +37,19 @@ from ._messages import (
 )
 from .provider import resolve_provider
 
+if TYPE_CHECKING:
+    from smolagents.models import (
+        ChatMessage,
+        ChatMessageStreamDelta,
+        Model,
+    )
+
 _logger = logging.getLogger(__name__)
 
-_Wrapper = Callable[
-    [Callable[..., Any], Any, tuple[Any, ...], dict[str, Any]], Any
+# ``Model`` is quoted because a type alias is evaluated at runtime, unlike an
+# annotation.
+_Wrapper: TypeAlias = Callable[
+    [Callable[..., Any], "Model", tuple[Any, ...], dict[str, Any]], Any
 ]
 
 
@@ -69,7 +78,7 @@ def _bind_arguments(
         return dict(kwargs)
 
 
-def _coerce_float(value: Any) -> float | None:
+def _coerce_float(value: object) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -77,7 +86,7 @@ def _coerce_float(value: Any) -> float | None:
     return None
 
 
-def _coerce_int(value: Any) -> int | None:
+def _coerce_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -85,7 +94,7 @@ def _coerce_int(value: Any) -> int | None:
     return None
 
 
-def _remove_parameter_sentinel() -> Any:
+def _remove_parameter_sentinel() -> object | None:
     """Return smolagents' ``REMOVE_PARAMETER`` sentinel, or ``None`` if absent."""
     try:
         from smolagents.models import (  # pylint: disable=import-outside-toplevel
@@ -98,7 +107,7 @@ def _remove_parameter_sentinel() -> Any:
 
 
 def _merged_request_kwargs(
-    instance: Any, bound: dict[str, Any]
+    instance: Model, bound: dict[str, Any]
 ) -> dict[str, Any]:
     """Rebuild the request keyword arguments smolagents will send.
 
@@ -112,9 +121,7 @@ def _merged_request_kwargs(
     """
     merged: dict[str, Any] = {}
     stop_sequences = bound.get("stop_sequences")
-    if stop_sequences is not None and getattr(
-        instance, "supports_stop_parameter", False
-    ):
+    if stop_sequences is not None and instance.supports_stop_parameter:
         merged["stop"] = stop_sequences
     response_format = bound.get("response_format")
     if response_format is not None:
@@ -122,11 +129,8 @@ def _merged_request_kwargs(
     call_kwargs = bound.get("kwargs")
     if isinstance(call_kwargs, dict):
         merged.update(call_kwargs)
-    model_kwargs = getattr(instance, "kwargs", None)
-    if not isinstance(model_kwargs, dict):
-        return merged
     remove = _remove_parameter_sentinel()
-    for name, value in model_kwargs.items():
+    for name, value in instance.kwargs.items():
         if remove is not None and value is remove:
             merged.pop(name, None)
         else:
@@ -182,7 +186,7 @@ def _output_type(merged: dict[str, Any]) -> str | None:
 
 
 def _apply_request_parameters(
-    invocation: InferenceInvocation, instance: Any, bound: dict[str, Any]
+    invocation: InferenceInvocation, instance: Model, bound: dict[str, Any]
 ) -> None:
     """Copy the request parameters smolagents will send onto the span."""
     merged = _merged_request_kwargs(instance, bound)
@@ -205,13 +209,13 @@ def _apply_request_parameters(
 
 
 def _apply_token_usage(
-    invocation: InferenceInvocation, output_message: Any
+    invocation: InferenceInvocation, output_message: ChatMessage
 ) -> None:
     # ChatMessage.token_usage is the only source: the per-model
     # last_input_token_count / last_output_token_count counters were removed
     # before the oldest supported smolagents. The in-process runtimes count the
     # prompt and generated tokens themselves and report them here.
-    token_usage = getattr(output_message, "token_usage", None)
+    token_usage = output_message.token_usage
     if token_usage is None:
         return
     invocation.input_tokens = token_usage.input_tokens
@@ -221,7 +225,7 @@ def _apply_token_usage(
 def _start_inference(
     handler: TelemetryHandler,
     wrapped: Callable[..., Any],
-    instance: Any,
+    instance: Model,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> InferenceInvocation:
@@ -234,7 +238,7 @@ def _start_inference(
     provider = resolve_provider(instance)
     invocation = handler.inference(
         provider,
-        request_model=getattr(instance, "model_id", None),
+        request_model=instance.model_id,
     )
     bound = _bind_arguments(wrapped, args, kwargs)
     _apply_request_parameters(invocation, instance, bound)
@@ -256,11 +260,11 @@ def model_generate(handler: TelemetryHandler) -> _Wrapper:
     """
 
     def wrapper(
-        wrapped: Callable[..., Any],
-        instance: Any,
+        wrapped: Callable[..., ChatMessage],
+        instance: Model,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> Any:
+    ) -> ChatMessage:
         invocation = _start_inference(handler, wrapped, instance, args, kwargs)
         with invocation:
             output_message = wrapped(*args, **kwargs)
@@ -274,7 +278,7 @@ def model_generate(handler: TelemetryHandler) -> _Wrapper:
     return wrapper
 
 
-class _ModelStreamWrapper(SyncStreamWrapper[Any]):
+class _ModelStreamWrapper(SyncStreamWrapper["ChatMessageStreamDelta"]):
     """Keep the ``chat`` span open until the delta stream is drained.
 
     Passing the invocation to ``super().__init__()`` turns on
@@ -287,7 +291,7 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
 
     def __init__(
         self,
-        stream: Generator[Any, Any, Any],
+        stream: Generator[ChatMessageStreamDelta, None, None],
         invocation: InferenceInvocation,
         handler: TelemetryHandler,
     ) -> None:
@@ -299,11 +303,11 @@ class _ModelStreamWrapper(SyncStreamWrapper[Any]):
         self._self_output_tokens = 0
         self._self_saw_token_usage = False
 
-    def _process_chunk(self, chunk: Any) -> None:
-        content = getattr(chunk, "content", None)
+    def _process_chunk(self, chunk: ChatMessageStreamDelta) -> None:
+        content = chunk.content
         if content and self._self_capture_content:
             self._self_content.append(content)
-        token_usage = getattr(chunk, "token_usage", None)
+        token_usage = chunk.token_usage
         if token_usage is not None:
             # Summed like agglomerate_stream_deltas, so the span agrees with the
             # totals the agent's monitor reports.
@@ -352,11 +356,11 @@ def model_generate_stream(handler: TelemetryHandler) -> _Wrapper:
     """
 
     def wrapper(
-        wrapped: Callable[..., Any],
-        instance: Any,
+        wrapped: Callable[..., Generator[ChatMessageStreamDelta, None, None]],
+        instance: Model,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> Any:
+    ) -> _ModelStreamWrapper:
         invocation = _start_inference(handler, wrapped, instance, args, kwargs)
         stream = wrapped(*args, **kwargs)
         return _ModelStreamWrapper(stream, invocation, handler)

@@ -14,7 +14,10 @@ every value has to stay low cardinality. ``TelemetryHandler.inference`` requires
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from smolagents.models import Model
 
 _logger = logging.getLogger(__name__)
 
@@ -30,7 +33,7 @@ _CLASS_NAME_TO_PROVIDER: dict[str, str] = {
 }
 
 
-def resolve_provider(instance: Any) -> str:
+def resolve_provider(instance: Model) -> str:
     """Return the ``gen_ai.provider.name`` value for a smolagents model instance."""
     # An instrumented model can be a user subclass of a patched class. Matching
     # the exact class name alone would report ``unknown`` for every subclass, so
