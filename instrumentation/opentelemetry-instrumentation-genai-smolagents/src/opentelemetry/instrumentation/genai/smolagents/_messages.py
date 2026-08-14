@@ -19,6 +19,9 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from smolagents.models import get_tool_json_schema
+from smolagents.utils import encode_image_base64
+
 from opentelemetry.util.genai.types import (
     Blob,
     FunctionToolDefinition,
@@ -77,14 +80,7 @@ def _decode_base64_image(image: str) -> tuple[bytes, str] | None:
         return None
 
 
-def _encode_image_base64(image: Image) -> str | None:
-    try:
-        from smolagents.utils import (  # pylint: disable=import-outside-toplevel
-            encode_image_base64,
-        )
-    except ImportError:
-        _logger.debug("smolagents.utils.encode_image_base64 is unavailable")
-        return None
+def _encode_base64_image(image: Image) -> str | None:
     try:
         encoded = encode_image_base64(image)
     except Exception:  # pylint: disable=broad-except
@@ -102,7 +98,7 @@ def _image_blob(image: Image | str) -> Blob | None:
     if isinstance(image, str):
         decoded = _decode_base64_image(image)
     else:
-        encoded = _encode_image_base64(image)
+        encoded = _encode_base64_image(image)
         decoded = (
             _decode_base64_image(encoded) if encoded is not None else None
         )
@@ -207,13 +203,6 @@ def _tool_parameters(tool: Tool) -> dict[str, Any] | None:
     non-JSON-Schema ``"any"`` type. ``get_tool_json_schema`` builds exactly the
     schema the provider receives.
     """
-    try:
-        from smolagents.models import (  # pylint: disable=import-outside-toplevel
-            get_tool_json_schema,
-        )
-    except ImportError:
-        _logger.debug("smolagents.models.get_tool_json_schema is unavailable")
-        return None
     try:
         schema = get_tool_json_schema(tool)
         parameters = schema["function"]["parameters"]

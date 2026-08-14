@@ -53,6 +53,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from typing import Any
 
+from smolagents import models
 from wrapt import wrap_function_wrapper
 
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
@@ -89,11 +90,10 @@ def _model_classes_defining(method: str) -> list[type]:
 
     A user-defined subclass that overrides the method shadows the patched one and
     emits no ``chat`` span. ``README.rst`` documents that limitation.
-    """
-    from smolagents import (  # pylint: disable=import-outside-toplevel
-        models,
-    )
 
+    A class is looked up by name so that a smolagents version without one of them
+    is skipped rather than raising.
+    """
     classes: list[type] = []
     for name in _IN_PROCESS_MODEL_CLASSES:
         model_cls = getattr(models, name, None)

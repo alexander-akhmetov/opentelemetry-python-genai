@@ -22,6 +22,8 @@ from collections.abc import Callable, Generator, Mapping
 from inspect import signature
 from typing import TYPE_CHECKING, Any, TypeAlias
 
+from smolagents.models import REMOVE_PARAMETER
+
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
 )
@@ -94,18 +96,6 @@ def _coerce_int(value: object) -> int | None:
     return None
 
 
-def _remove_parameter_sentinel() -> object | None:
-    """Return smolagents' ``REMOVE_PARAMETER`` sentinel, or ``None`` if absent."""
-    try:
-        from smolagents.models import (  # pylint: disable=import-outside-toplevel
-            REMOVE_PARAMETER,
-        )
-    except ImportError:
-        _logger.debug("smolagents.models.REMOVE_PARAMETER is unavailable")
-        return None
-    return REMOVE_PARAMETER
-
-
 def _merged_request_kwargs(
     instance: Model, bound: dict[str, Any]
 ) -> dict[str, Any]:
@@ -129,9 +119,8 @@ def _merged_request_kwargs(
     call_kwargs = bound.get("kwargs")
     if isinstance(call_kwargs, dict):
         merged.update(call_kwargs)
-    remove = _remove_parameter_sentinel()
     for name, value in instance.kwargs.items():
-        if remove is not None and value is remove:
+        if value is REMOVE_PARAMETER:
             merged.pop(name, None)
         else:
             merged[name] = value
