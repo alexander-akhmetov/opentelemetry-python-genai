@@ -28,7 +28,14 @@ Usage
 
     model = TransformersModel(model_id="HuggingFaceTB/SmolLM2-135M-Instruct")
     model.generate(
-        [{"role": "user", "content": "How many seconds are in a week?"}]
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "How many seconds are in a week?"}
+                ],
+            }
+        ]
     )
 
 Configuration
