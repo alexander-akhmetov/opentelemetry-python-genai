@@ -17,7 +17,7 @@ import base64
 import binascii
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from smolagents.models import get_tool_json_schema
 from smolagents.utils import encode_image_base64
@@ -39,6 +39,12 @@ if TYPE_CHECKING:
     from smolagents.tools import Tool
 
 _logger = logging.getLogger(__name__)
+
+# One element of a message ``content`` list, typed as smolagents types it:
+# ``ChatMessage.content`` is ``str | list[dict[str, Any]]``. The values within an
+# element have mixed types, a ``str`` under ``text``, a nested dict under
+# ``image_url``, and a PIL image under ``image``.
+_ContentElement: TypeAlias = dict[str, Any]
 
 _DEFAULT_IMAGE_MIME_TYPE = "image/png"
 _DATA_URL_PREFIX = "data:"
@@ -108,7 +114,7 @@ def _image_blob(image: Image | str) -> Blob | None:
     return Blob(mime_type=mime_type, modality="image", content=content)
 
 
-def _image_part_from_element(element: dict[str, Any]) -> Uri | Blob | None:
+def _image_part_from_element(element: _ContentElement) -> Uri | Blob | None:
     content_type = element.get("type")
     if content_type == "image_url":
         image_url = element.get("image_url")
@@ -124,7 +130,7 @@ def _image_part_from_element(element: dict[str, Any]) -> Uri | Blob | None:
 
 
 def _parts_from_content(
-    content: str | list[dict[str, Any]] | None,
+    content: str | list[_ContentElement] | None,
 ) -> list[MessagePart]:
     parts: list[MessagePart] = []
     if isinstance(content, str):
@@ -153,7 +159,7 @@ def _parts_from_content(
 
 def _get_role_and_content(
     message: ChatMessage | dict[str, Any],
-) -> tuple[MessageRole | str | None, str | list[dict[str, Any]] | None]:
+) -> tuple[MessageRole | str | None, str | list[_ContentElement] | None]:
     # smolagents reads a message the same way: a dict goes through
     # ChatMessage.from_dict, anything else has its attributes read directly.
     if isinstance(message, dict):
