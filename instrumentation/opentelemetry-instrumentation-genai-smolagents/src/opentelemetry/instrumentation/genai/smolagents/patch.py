@@ -211,6 +211,53 @@ def _apply_token_usage(
     invocation.output_tokens = token_usage.output_tokens
 
 
+def _record_request(
+    handler: TelemetryHandler,
+    invocation: InferenceInvocation,
+    wrapped: Callable[..., Any],
+    instance: Model,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Record the request on the invocation. Extraction errors are dropped.
+
+    The messages, tools and keyword arguments come from the caller, so the
+    conversion can get a shape it does not handle. The span is already
+    started and the model has not been called yet, so an error raised here
+    would both break the call and leave the span unfinished.
+    """
+    try:
+        bound = _bind_arguments(wrapped, args, kwargs)
+        _apply_request_parameters(invocation, instance, bound)
+        invocation.tool_definitions = to_tool_definitions(
+            bound.get("tools_to_call_from")
+        )
+        if handler.should_capture_content():
+            invocation.input_messages = to_input_messages(
+                bound.get("messages")
+            )
+    except Exception:  # pylint: disable=broad-except
+        _logger.debug("Failed to record the request", exc_info=True)
+
+
+def _record_response(
+    handler: TelemetryHandler,
+    invocation: InferenceInvocation,
+    output_message: ChatMessage,
+) -> None:
+    """Record the response on the invocation. Extraction errors are dropped.
+
+    The model call has already succeeded at this point, so an error raised
+    here would turn a completed call into a failed one.
+    """
+    try:
+        _apply_token_usage(invocation, output_message)
+        if handler.should_capture_content():
+            invocation.output_messages = [to_output_message(output_message)]
+    except Exception:  # pylint: disable=broad-except
+        _logger.debug("Failed to record the response", exc_info=True)
+
+
 def _start_inference(
     handler: TelemetryHandler,
     wrapped: Callable[..., Any],
@@ -229,13 +276,7 @@ def _start_inference(
         provider,
         request_model=instance.model_id,
     )
-    bound = _bind_arguments(wrapped, args, kwargs)
-    _apply_request_parameters(invocation, instance, bound)
-    invocation.tool_definitions = to_tool_definitions(
-        bound.get("tools_to_call_from")
-    )
-    if handler.should_capture_content():
-        invocation.input_messages = to_input_messages(bound.get("messages"))
+    _record_request(handler, invocation, wrapped, instance, args, kwargs)
     return invocation
 
 
@@ -257,11 +298,7 @@ def model_generate(handler: TelemetryHandler) -> _Wrapper:
         invocation = _start_inference(handler, wrapped, instance, args, kwargs)
         with invocation:
             output_message = wrapped(*args, **kwargs)
-            _apply_token_usage(invocation, output_message)
-            if handler.should_capture_content():
-                invocation.output_messages = [
-                    to_output_message(output_message)
-                ]
+            _record_response(handler, invocation, output_message)
             return output_message
 
     return wrapper

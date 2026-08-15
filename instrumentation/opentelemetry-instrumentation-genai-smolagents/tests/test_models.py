@@ -21,6 +21,9 @@ import pytest
 from smolagents.models import ChatMessage, MessageRole
 
 from opentelemetry.context import Context
+from opentelemetry.instrumentation.genai.smolagents import (
+    patch as patch_module,
+)
 from opentelemetry.instrumentation.genai.smolagents._messages import (
     to_input_messages,
     to_output_message,
@@ -236,6 +239,68 @@ def test_lifecycle_recorder_sees_the_happy_path(
     transformers_model().generate(messages=MESSAGES)
 
     assert len(lifecycle.started) == 1
+    assert lifecycle.leaked == []
+
+
+def test_generate_bad_call_records_an_error_span(
+    instrument_with_content, span_exporter, lifecycle
+) -> None:
+    model = transformers_model()
+
+    # messages is required, so the call fails before it reaches the runtime.
+    with pytest.raises(TypeError):
+        model.generate()
+
+    (span,) = spans_by_operation(span_exporter.get_finished_spans(), "chat")
+    assert span.status.status_code == StatusCode.ERROR
+    assert attr(span, error_attributes.ERROR_TYPE) == "TypeError"
+    assert lifecycle.leaked == []
+
+
+class _NotATool:
+    """tools_to_call_from is a plain runtime kwarg; the annotation is a
+    contract, not enforcement."""
+
+
+def test_bad_tool_does_not_leak_a_span(
+    instrument_with_content, span_exporter, lifecycle
+) -> None:
+    model = transformers_model()
+
+    # The AttributeError is the runtime's own, from building the tool schemas.
+    # Reading the tool for telemetry must not fail the call before that.
+    with pytest.raises(AttributeError, match="has no attribute 'inputs'"):
+        model.generate(messages=MESSAGES, tools_to_call_from=[_NotATool()])
+
+    (span,) = spans_by_operation(span_exporter.get_finished_spans(), "chat")
+    assert span.status.status_code == StatusCode.ERROR
+    assert attr(span, error_attributes.ERROR_TYPE) == "AttributeError"
+    assert lifecycle.leaked == []
+
+
+@pytest.mark.parametrize(
+    "conversion", ["to_input_messages", "to_output_message"]
+)
+def test_a_failed_conversion_does_not_break_the_call(
+    instrument_with_content,
+    span_exporter,
+    lifecycle,
+    monkeypatch: pytest.MonkeyPatch,
+    conversion: str,
+) -> None:
+    # A shape the conversion cannot read drops the content from the span, and
+    # changes nothing else.
+    def raise_error(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("unexpected message shape")
+
+    monkeypatch.setattr(patch_module, conversion, raise_error)
+
+    output = transformers_model().generate(messages=MESSAGES)
+    assert output.content == "In Paris"
+
+    (span,) = spans_by_operation(span_exporter.get_finished_spans(), "chat")
+    assert span.status.status_code == StatusCode.UNSET
+    assert attr(span, GenAI.GEN_AI_USAGE_INPUT_TOKENS) == 3
     assert lifecycle.leaked == []
 
 
