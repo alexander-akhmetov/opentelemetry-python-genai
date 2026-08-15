@@ -351,7 +351,11 @@ def model_generate_stream(handler: TelemetryHandler) -> _Wrapper:
         kwargs: dict[str, Any],
     ) -> _ModelStreamWrapper:
         invocation = _start_inference(handler, wrapped, instance, args, kwargs)
-        stream = wrapped(*args, **kwargs)
-        return _ModelStreamWrapper(stream, invocation, handler)
+        try:
+            stream = wrapped(*args, **kwargs)
+            return _ModelStreamWrapper(stream, invocation, handler)
+        except Exception as error:
+            invocation.fail(error)
+            raise
 
     return wrapper

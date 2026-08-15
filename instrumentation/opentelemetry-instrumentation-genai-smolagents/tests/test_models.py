@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 from smolagents.models import ChatMessage, MessageRole
 
+from opentelemetry.context import Context
 from opentelemetry.instrumentation.genai.smolagents._messages import (
     to_input_messages,
     to_output_message,
@@ -32,6 +33,7 @@ from opentelemetry.instrumentation.genai.smolagents.patch import (
 from opentelemetry.instrumentation.genai.smolagents.provider import (
     resolve_provider,
 )
+from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
 )
@@ -195,6 +197,46 @@ def test_runtime_error_is_recorded_and_reraised(
     assert span.status.status_code == StatusCode.ERROR
     assert attr(span, error_attributes.ERROR_TYPE) == "RuntimeError"
     assert attr(span, GenAI.GEN_AI_RESPONSE_FINISH_REASONS) is None
+
+
+class _LifecycleRecorder(SpanProcessor):
+    """Records span starts and ends.
+
+    The exporter only sees a span once it ends, so an unfinished span reads
+    there as no span at all.
+    """
+
+    def __init__(self) -> None:
+        self.started: list[str] = []
+        self.ended: list[str] = []
+
+    def on_start(
+        self, span: Span, parent_context: Context | None = None
+    ) -> None:
+        self.started.append(span.name)
+
+    def on_end(self, span: ReadableSpan) -> None:
+        self.ended.append(span.name)
+
+    @property
+    def leaked(self) -> list[str]:
+        return self.started[len(self.ended) :]
+
+
+@pytest.fixture
+def lifecycle(tracer_provider) -> _LifecycleRecorder:
+    recorder = _LifecycleRecorder()
+    tracer_provider.add_span_processor(recorder)
+    return recorder
+
+
+def test_lifecycle_recorder_sees_the_happy_path(
+    instrument_with_content, lifecycle
+) -> None:
+    transformers_model().generate(messages=MESSAGES)
+
+    assert len(lifecycle.started) == 1
+    assert lifecycle.leaked == []
 
 
 def test_tool_definitions_recorded(
@@ -545,16 +587,20 @@ def test_generate_stream_stays_a_generator(
     list(stream)
 
 
-def test_generate_stream_bad_call_emits_no_span(
-    instrument_with_content, span_exporter
+def test_generate_stream_bad_call_records_an_error_span(
+    instrument_with_content, span_exporter, lifecycle
 ) -> None:
     model = transformers_model(stream_chunks=["In Paris"])
 
     # messages is required, so the call fails before it reaches the runtime.
+    # Nothing will drain the stream, so the span has to end here.
     with pytest.raises(TypeError):
         model.generate_stream()
 
-    assert span_exporter.get_finished_spans() == ()
+    (span,) = spans_by_operation(span_exporter.get_finished_spans(), "chat")
+    assert span.status.status_code == StatusCode.ERROR
+    assert attr(span, error_attributes.ERROR_TYPE) == "TypeError"
+    assert lifecycle.leaked == []
 
 
 def test_generate_stream_error_mid_iteration_is_recorded_and_reraised(
