@@ -71,6 +71,7 @@ def _unwrap_role(role: MessageRole | str | None) -> str | None:
     return _ROLE_MAP.get(name, name)
 
 
+# TODO leverage util helpers
 def _decode_base64_image(image: str) -> tuple[bytes, str] | None:
     """Decode a base64 payload or data URL into ``(bytes, mime_type)``."""
     mime_type = _DEFAULT_IMAGE_MIME_TYPE
@@ -89,7 +90,7 @@ def _decode_base64_image(image: str) -> tuple[bytes, str] | None:
 def _encode_base64_image(image: Image) -> str | None:
     try:
         encoded = encode_image_base64(image)
-    except Exception:  # pylint: disable=broad-except
+    except BaseException:  # pylint: disable=broad-except
         _logger.debug(
             "Failed to encode image of type %s, dropping it from telemetry",
             type(image).__name__,

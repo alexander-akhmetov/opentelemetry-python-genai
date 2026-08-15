@@ -160,7 +160,7 @@ class SmolagentsInstrumentor(BaseInstrumentor):
                     model_generate_stream(handler),
                 )
                 self._wrapped_generate_stream_classes.append(model_cls)
-        except Exception:
+        except BaseException:
             # BaseInstrumentor.instrument() doesn't mark the instrumentor as
             # instrumented when _instrument raises, so uninstrument() would
             # refuse to run and leave the patches applied with no way to undo.
