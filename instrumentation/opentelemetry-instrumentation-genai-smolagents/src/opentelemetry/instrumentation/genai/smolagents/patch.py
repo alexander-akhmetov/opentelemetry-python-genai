@@ -4,35 +4,47 @@
 """wrapt wrapper factories for smolagents instrumentation.
 
 Each factory takes the shared :class:`TelemetryHandler` and returns a wrapper
-suitable for :func:`wrapt.wrap_function_wrapper`, applied to the in-process
-model classes only (see ``_IN_PROCESS_MODEL_CLASSES``):
+suitable for :func:`wrapt.wrap_function_wrapper`:
 
-- :func:`model_generate` wraps ``generate`` -> ``chat`` span.
+- :func:`model_generate` wraps ``generate`` -> ``chat`` span, applied to the
+  in-process model classes only (see ``_IN_PROCESS_MODEL_CLASSES``).
 - :func:`model_generate_stream` wraps ``generate_stream`` -> ``chat`` span, held
   open until the stream is drained.
+- :func:`agent_run` wraps ``MultiStepAgent.run`` -> ``invoke_agent`` span, held
+  open until the run generator is drained when the caller streams.
 
-Original library exceptions are always re-raised unmodified; telemetry is
-finalized via ``invocation.stop()`` / ``invocation.fail(exc)``.
+Original library exceptions are re-raised unmodified. Telemetry is finalized
+through ``invocation.stop()`` or ``invocation.fail(exc)``.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Generator, Mapping
-from inspect import signature
-from typing import TYPE_CHECKING, Any, TypeAlias
+from collections.abc import Callable, Generator, Iterator, Mapping
+from contextlib import contextmanager
+from functools import cache
+from inspect import Signature, signature
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar
 
+from smolagents import AgentMaxStepsError
+from smolagents.agents import RunResult
+from smolagents.memory import ActionStep, FinalAnswerStep
 from smolagents.models import REMOVE_PARAMETER
 
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
 )
 from opentelemetry.util.genai.handler import TelemetryHandler
-from opentelemetry.util.genai.invocation import InferenceInvocation
+from opentelemetry.util.genai.invocation import (
+    AgentInvocation,
+    InferenceInvocation,
+)
 from opentelemetry.util.genai.stream import SyncStreamWrapper
 from opentelemetry.util.genai.types import OutputMessage, Text
 
 from ._messages import (
+    final_answer_parts,
+    task_to_input_messages,
     to_input_messages,
     to_output_message,
     to_tool_definitions,
@@ -40,6 +52,8 @@ from ._messages import (
 from .provider import resolve_provider
 
 if TYPE_CHECKING:
+    from smolagents.agents import MultiStepAgent
+    from smolagents.memory import PlanningStep
     from smolagents.models import (
         ChatMessage,
         ChatMessageStreamDelta,
@@ -48,11 +62,39 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# ``Model`` is quoted because a type alias is evaluated at runtime, unlike an
-# annotation.
+_InstanceT = TypeVar("_InstanceT")
+
 _Wrapper: TypeAlias = Callable[
-    [Callable[..., Any], "Model", tuple[Any, ...], dict[str, Any]], Any
+    [Callable[..., Any], _InstanceT, tuple[Any, ...], dict[str, Any]], Any
 ]
+
+# smolagents declares these as the values yielded by
+# ``MultiStepAgent._run_stream``. ``ChatMessageStreamDelta`` appears only with
+# ``stream_outputs=True``. The alias is quoted because it is evaluated at
+# runtime, while ``PlanningStep`` and ``ChatMessageStreamDelta`` are imported
+# only for type checking.
+_RunStreamChunk: TypeAlias = (
+    "ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta"
+)
+
+
+@contextmanager
+def _recording(what: str) -> Iterator[None]:
+    """Record telemetry without letting a failure reach the caller.
+
+    Recorded values can come from user code or library state, so a conversion
+    can receive a shape it does not handle. The span has already started, so an
+    error escaping here would break the call and leave the span unfinished.
+    """
+    try:
+        yield
+    except Exception:  # pylint: disable=broad-except
+        _logger.debug("Failed to record %s", what, exc_info=True)
+
+
+@cache
+def _cached_signature(wrapped: Callable[..., Any]) -> Signature:
+    return signature(wrapped)
 
 
 def _bind_arguments(
@@ -63,12 +105,13 @@ def _bind_arguments(
     """Bind call args to the wrapped callable's signature, applying defaults.
 
     smolagents passes the interesting arguments positionally
-    (``model.generate(input_messages)``), so binding is what makes them
-    readable by name. On a binding failure the keyword arguments are returned
-    on their own, without the positional ones and without the defaults.
+    (``model.generate(input_messages)``, ``agent.run(task)``), so binding is
+    what makes them readable by name. On a binding failure the keyword
+    arguments are returned on their own, without the positional ones and
+    without the defaults.
     """
     try:
-        bound = signature(wrapped).bind(*args, **kwargs)
+        bound = _cached_signature(wrapped).bind(*args, **kwargs)
         bound.apply_defaults()
         return dict(bound.arguments)
     except (TypeError, ValueError):
@@ -219,14 +262,7 @@ def _record_request(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> None:
-    """Record the request on the invocation. Extraction errors are dropped.
-
-    The messages, tools and keyword arguments come from the caller, so the
-    conversion can get a shape it does not handle. The span is already
-    started and the model has not been called yet, so an error raised here
-    would both break the call and leave the span unfinished.
-    """
-    try:
+    with _recording("the chat request"):
         bound = _bind_arguments(wrapped, args, kwargs)
         _apply_request_parameters(invocation, instance, bound)
         invocation.tool_definitions = to_tool_definitions(
@@ -236,8 +272,6 @@ def _record_request(
             invocation.input_messages = to_input_messages(
                 bound.get("messages")
             )
-    except Exception:  # pylint: disable=broad-except
-        _logger.debug("Failed to record the request", exc_info=True)
 
 
 def _record_response(
@@ -245,17 +279,10 @@ def _record_response(
     invocation: InferenceInvocation,
     output_message: ChatMessage,
 ) -> None:
-    """Record the response on the invocation. Extraction errors are dropped.
-
-    The model call has already succeeded at this point, so an error raised
-    here would turn a completed call into a failed one.
-    """
-    try:
+    with _recording("the chat response"):
         _apply_token_usage(invocation, output_message)
         if handler.should_capture_content():
             invocation.output_messages = [to_output_message(output_message)]
-    except Exception:  # pylint: disable=broad-except
-        _logger.debug("Failed to record the response", exc_info=True)
 
 
 def _start_inference(
@@ -280,7 +307,7 @@ def _start_inference(
     return invocation
 
 
-def model_generate(handler: TelemetryHandler) -> _Wrapper:
+def model_generate(handler: TelemetryHandler) -> _Wrapper[Model]:
     """Wrap a defining ``Model.generate`` to emit a ``chat`` span.
 
     An in-process runtime returns the generated text, the token counts it made
@@ -374,7 +401,7 @@ class _ModelStreamWrapper(SyncStreamWrapper["ChatMessageStreamDelta"]):
         self._finalize(error)
 
 
-def model_generate_stream(handler: TelemetryHandler) -> _Wrapper:
+def model_generate_stream(handler: TelemetryHandler) -> _Wrapper[Model]:
     """Wrap a defining ``Model.generate_stream`` to emit a ``chat`` span.
 
     ``stream_outputs=True`` routes an agent's model calls here. The span stays
@@ -394,5 +421,243 @@ def model_generate_stream(handler: TelemetryHandler) -> _Wrapper:
         except Exception as error:
             invocation.fail(error)
             raise
+
+    return wrapper
+
+
+def _run_finish_reason(agent: MultiStepAgent) -> str:
+    """Why the run stopped: ``"stop"`` for an answer, ``"length"`` for max_steps.
+
+    A run that uses up ``max_steps`` does not raise. smolagents asks the model
+    for a closing answer, appends an ``ActionStep`` carrying
+    ``AgentMaxStepsError`` and returns normally. Without this check, a run that
+    gave up looks like one that answered.
+    """
+    steps = agent.memory.steps
+    last_step = steps[-1] if steps else None
+    if isinstance(last_step, ActionStep) and isinstance(
+        last_step.error, AgentMaxStepsError
+    ):
+        return "length"
+    return "stop"
+
+
+def _record_run_answer(
+    invocation: AgentInvocation,
+    agent: MultiStepAgent,
+    output: object,
+    *,
+    capture_content: bool,
+) -> None:
+    finish_reason = _run_finish_reason(agent)
+    invocation.finish_reasons = [finish_reason]
+    if capture_content:
+        invocation.output_messages = [
+            OutputMessage(
+                role="assistant",
+                parts=final_answer_parts(output),
+                finish_reason=finish_reason,
+            )
+        ]
+
+
+def _finish_agent_invocation(
+    invocation: AgentInvocation, error: BaseException | None = None
+) -> None:
+    if error is None:
+        try:
+            invocation.stop()
+        except Exception:  # pylint: disable=broad-except
+            _logger.debug(
+                "Failed to finish the agent invocation", exc_info=True
+            )
+        return
+    try:
+        if isinstance(error, Exception):
+            invocation.fail(error)
+        else:
+            invocation.stop()
+    except BaseException:  # pylint: disable=broad-except
+        _logger.debug("Failed to finish the agent invocation", exc_info=True)
+
+
+class _AgentRunStreamWrapper(SyncStreamWrapper[_RunStreamChunk]):
+    """Keep the ``invoke_agent`` span open until the run generator is drained."""
+
+    def __init__(
+        self,
+        stream: Generator[_RunStreamChunk, None, None],
+        invocation: AgentInvocation,
+        agent: MultiStepAgent,
+        *,
+        capture_content: bool,
+    ) -> None:
+        # The invocation is deliberately not passed to the base class: it would
+        # mark the run as streamed and record per-chunk generation metrics,
+        # which describe a model response rather than an agent's steps.
+        super().__init__(stream)
+        self._self_agent_invocation = invocation
+        self._self_agent = agent
+        self._self_capture_content = capture_content
+        self._self_final_output: object = None
+        self._self_saw_final = False
+
+    def __next__(self) -> _RunStreamChunk:
+        try:
+            return super().__next__()
+        except BaseException as error:
+            self._finalize_failure(error)
+            raise
+
+    def close(self) -> None:
+        try:
+            super().close()
+        except BaseException as error:
+            self._finalize_failure(error)
+            raise
+
+    def _process_chunk(self, chunk: _RunStreamChunk) -> None:
+        if isinstance(chunk, FinalAnswerStep):
+            self._self_final_output = chunk.output
+            self._self_saw_final = True
+
+    def _on_stream_end(self) -> None:
+        # Runs while the caller is iterating, so a failure here would replace
+        # the StopIteration that ends their loop.
+        with _recording("the agent run"):
+            if self._self_saw_final:
+                _record_run_answer(
+                    self._self_agent_invocation,
+                    self._self_agent,
+                    self._self_final_output,
+                    capture_content=self._self_capture_content,
+                )
+        _finish_agent_invocation(self._self_agent_invocation)
+
+    def _on_stream_error(self, error: BaseException) -> None:
+        _finish_agent_invocation(self._self_agent_invocation, error)
+
+
+def _start_agent_run(
+    handler: TelemetryHandler,
+    agent: MultiStepAgent,
+    bound: dict[str, Any],
+    *,
+    capture_content: bool,
+) -> AgentInvocation:
+    """Start the ``invoke_agent`` span and record what the agent was built with.
+
+    The span opens after reading the attributes needed to create it. If an
+    attribute read fails, no span needs cleanup.
+    """
+    # smolagents allows an unnamed agent and a model without ``model_id``. A
+    # managed agent must have a name, but other agents use their class name here.
+    invocation = handler.invoke_local_agent(
+        agent_name=agent.name or type(agent).__name__,
+        # An agent runs exactly one model, which is the condition semconv
+        # puts on gen_ai.request.model for an agent span.
+        request_model=getattr(agent.model, "model_id", None),
+    )
+    try:
+        with _recording("the agent"):
+            invocation.agent_description = agent.description
+            # The model can call a managed agent like a tool (see _ModelCallable),
+            # so it belongs in the definitions next to the agent's own tools.
+            invocation.tool_definitions = to_tool_definitions(
+                [*agent.tools.values(), *agent.managed_agents.values()]
+            )
+            if capture_content:
+                invocation.input_messages = task_to_input_messages(
+                    bound.get("task"), bound.get("images")
+                )
+    except BaseException as error:
+        _finish_agent_invocation(invocation, error)
+        raise
+    return invocation
+
+
+def _record_agent_run(
+    invocation: AgentInvocation,
+    agent: MultiStepAgent,
+    bound: dict[str, Any],
+    result: object,
+    *,
+    capture_content: bool,
+) -> _AgentRunStreamWrapper | None:
+    """Record what ``run`` returned, or wrap a stream the caller has to drain.
+
+    A stream gets a wrapper that keeps the invocation open until the caller
+    drains it. For a finished run, this records the outcome before the caller
+    ends the invocation.
+    """
+    if capture_content and bound.get("additional_args"):
+        with _recording("the agent task"):
+            # run() appends the additional arguments to the task, so the
+            # effective task is only readable after the call.
+            invocation.input_messages = task_to_input_messages(
+                agent.task or bound.get("task"), bound.get("images")
+            )
+
+    if bound.get("stream") and isinstance(result, Generator):
+        return _AgentRunStreamWrapper(
+            result,
+            invocation,
+            agent,
+            capture_content=capture_content,
+        )
+
+    with _recording("the agent run"):
+        # ``run()`` returns a RunResult when ``return_full_result`` is true.
+        # That argument defaults to the agent-level
+        # ``self.return_full_result``, so a plain ``run(task)`` can return one
+        # too.
+        output = result.output if isinstance(result, RunResult) else result
+        _record_run_answer(
+            invocation, agent, output, capture_content=capture_content
+        )
+    return None
+
+
+def agent_run(handler: TelemetryHandler) -> _Wrapper[MultiStepAgent]:
+    """Wrap ``MultiStepAgent.run`` to emit an ``invoke_agent`` span."""
+
+    def wrapper(
+        wrapped: Callable[..., Any],
+        instance: MultiStepAgent,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        agent = instance
+        bound = _bind_arguments(wrapped, args, kwargs)
+        capture_content = handler.should_capture_content()
+        invocation = _start_agent_run(
+            handler, agent, bound, capture_content=capture_content
+        )
+
+        try:
+            result = wrapped(*args, **kwargs)
+        except BaseException as error:
+            # A streamed run outlives this call, so the invocation cannot live
+            # in a ``with`` block the way :func:`model_generate`'s does. An
+            # Exception marks a failure, while anything else ends the span
+            # without an error.
+            _finish_agent_invocation(invocation, error)
+            raise
+
+        stream: _AgentRunStreamWrapper | None = None
+        try:
+            stream = _record_agent_run(
+                invocation,
+                agent,
+                bound,
+                result,
+                capture_content=capture_content,
+            )
+        finally:
+            # _record_agent_run swallows its own failures. This handles an
+            # interrupt during recording.
+            if stream is None:
+                _finish_agent_invocation(invocation)
+        return stream if stream is not None else result
 
     return wrapper
