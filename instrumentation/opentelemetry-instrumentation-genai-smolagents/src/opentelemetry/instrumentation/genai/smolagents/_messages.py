@@ -1,11 +1,12 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Convert smolagents message and tool shapes into util-genai GenAI types.
+"""Convert smolagents message, tool, and agent-run values to GenAI types.
 
 smolagents passes ``generate(messages=...)`` a list of ``ChatMessage`` objects
-or plain dicts, and returns a ``ChatMessage``. This module maps those, and the
-``tools_to_call_from`` tool objects, onto the types in
+or plain dicts, and returns a ``ChatMessage``. ``MultiStepAgent.run`` takes a
+task string and optional images, and returns a final answer. This module maps
+those values, and the ``tools_to_call_from`` tool objects, onto the types in
 ``opentelemetry.util.genai.types``. util-genai then serializes them into
 ``gen_ai.input.messages``, ``gen_ai.output.messages``, and
 ``gen_ai.tool.definitions``.
@@ -16,9 +17,11 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+from collections.abc import Sequence
 from enum import Enum
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
+from PIL.Image import Image
 from smolagents.models import get_tool_json_schema
 from smolagents.utils import encode_image_base64
 
@@ -34,7 +37,7 @@ from opentelemetry.util.genai.types import (
 )
 
 if TYPE_CHECKING:
-    from PIL.Image import Image
+    from smolagents.agents import MultiStepAgent
     from smolagents.models import ChatMessage, MessageRole
     from smolagents.tools import Tool
 
@@ -45,6 +48,9 @@ _logger = logging.getLogger(__name__)
 # element have mixed types, a ``str`` under ``text``, a nested dict under
 # ``image_url``, and a PIL image under ``image``.
 _ContentElement: TypeAlias = dict[str, Any]
+
+# smolagents passes managed agents in ``tools_to_call_from`` alongside tools.
+_ModelCallable: TypeAlias = "Tool | MultiStepAgent"
 
 _DEFAULT_IMAGE_MIME_TYPE = "image/png"
 _DATA_URL_PREFIX = "data:"
@@ -204,18 +210,21 @@ def to_output_message(output_message: ChatMessage) -> OutputMessage:
     return OutputMessage(role=role, parts=parts, finish_reason="")
 
 
-def _tool_parameters(tool: Tool) -> dict[str, Any] | None:
+def _tool_parameters(tool: _ModelCallable) -> dict[str, Any] | None:
     """Return the JSON Schema ``parameters`` object for a smolagents tool.
 
     A tool's ``inputs`` map is not a JSON Schema on its own: smolagents wraps it
     in an object schema, derives ``required`` from ``nullable``, and rewrites its
     non-JSON-Schema ``"any"`` type. ``get_tool_json_schema`` builds exactly the
     schema the provider receives.
+
+    ``get_tool_json_schema`` also accepts managed agents despite its ``Tool``
+    annotation.
     """
     try:
-        schema = get_tool_json_schema(tool)
+        schema = get_tool_json_schema(cast("Tool", tool))
         parameters = schema["function"]["parameters"]
-    except Exception:  # pylint: disable=broad-except
+    except BaseException:  # pylint: disable=broad-except
         _logger.debug(
             "Failed to build a JSON Schema for tool %s",
             tool.name,
@@ -226,21 +235,52 @@ def _tool_parameters(tool: Tool) -> dict[str, Any] | None:
 
 
 def to_tool_definitions(
-    tools: list[Tool] | None,
+    tools: Sequence[_ModelCallable] | None,
 ) -> list[ToolDefinition] | None:
     """Map smolagents tool objects to function tool definitions.
 
-    ``Tool.validate_arguments`` runs on every instantiation and requires a
-    non-empty ``name`` and a ``description``, so both are read directly.
+    ``Tool.validate_arguments`` requires every tool to have a non-empty
+    ``name`` and ``description``. A managed agent must also have both. An
+    invalid entry without a name is skipped instead of recorded under an empty
+    name.
     """
     if not tools:
         return None
-    definitions: list[ToolDefinition] = [
-        FunctionToolDefinition(
-            name=tool.name,
-            description=tool.description,
-            parameters=_tool_parameters(tool),
+    definitions: list[ToolDefinition] = []
+    for tool in tools:
+        name = tool.name
+        if not name:
+            continue
+        definitions.append(
+            FunctionToolDefinition(
+                name=name,
+                description=tool.description,
+                parameters=_tool_parameters(tool),
+            )
         )
-        for tool in tools
-    ]
-    return definitions
+    return definitions or None
+
+
+def final_answer_parts(output: object) -> list[MessagePart]:
+    """Convert image and string answers without file-writing ``__str__`` calls."""
+    if isinstance(output, Image):
+        if blob := _image_blob(output):
+            return [blob]
+        return []
+    text = str.__str__(output) if isinstance(output, str) else str(output)
+    return [Text(content=text)]
+
+
+def task_to_input_messages(
+    task: str | None, images: list[Image | str] | None
+) -> list[InputMessage]:
+    parts: list[MessagePart] = []
+    if task:
+        parts.append(Text(content=task))
+    if isinstance(images, list):
+        for image in images:
+            if blob := _image_blob(image):
+                parts.append(blob)
+    if not parts:
+        return []
+    return [InputMessage(role="user", parts=parts)]
