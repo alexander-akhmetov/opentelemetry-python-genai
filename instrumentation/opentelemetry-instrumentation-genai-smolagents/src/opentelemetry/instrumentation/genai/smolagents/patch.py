@@ -19,8 +19,8 @@ through ``invocation.stop()`` or ``invocation.fail(exc)``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Generator, Iterator, Mapping
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Generator, Mapping
+from contextlib import ExitStack
 from inspect import Signature, signature
 from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar
 
@@ -72,15 +72,6 @@ _Wrapper: TypeAlias = Callable[
 _RunStreamChunk: TypeAlias = (
     "ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta"
 )
-
-
-@contextmanager
-def _recording(what: str) -> Iterator[None]:
-    """Suppress extraction errors so telemetry cannot break the call."""
-    try:
-        yield
-    except Exception:  # pylint: disable=broad-except
-        _logger.debug("Failed to record %s", what, exc_info=True)
 
 
 def _finish(
@@ -271,16 +262,13 @@ def _record_request(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> None:
-    with _recording("the chat request"):
-        bound = _bind_arguments(wrapped, args, kwargs)
-        _apply_request_parameters(invocation, instance, bound)
-        invocation.tool_definitions = to_tool_definitions(
-            bound.get("tools_to_call_from")
-        )
-        if handler.should_capture_content():
-            invocation.input_messages = to_input_messages(
-                bound.get("messages")
-            )
+    bound = _bind_arguments(wrapped, args, kwargs)
+    _apply_request_parameters(invocation, instance, bound)
+    invocation.tool_definitions = to_tool_definitions(
+        bound.get("tools_to_call_from")
+    )
+    if handler.should_capture_content():
+        invocation.input_messages = to_input_messages(bound.get("messages"))
 
 
 def _record_response(
@@ -288,10 +276,9 @@ def _record_response(
     invocation: InferenceInvocation,
     output_message: ChatMessage,
 ) -> None:
-    with _recording("the chat response"):
-        _apply_token_usage(invocation, output_message)
-        if handler.should_capture_content():
-            invocation.output_messages = [to_output_message(output_message)]
+    _apply_token_usage(invocation, output_message)
+    if handler.should_capture_content():
+        invocation.output_messages = [to_output_message(output_message)]
 
 
 def _start_inference(
@@ -517,8 +504,7 @@ class _AgentRunStreamWrapper(SyncStreamWrapper[_RunStreamChunk]):
             self._self_saw_final = True
 
     def _on_stream_end(self) -> None:
-        # Recording errors must not replace the stream's StopIteration.
-        with _recording("the agent run"):
+        try:
             if self._self_saw_final:
                 _record_run_answer(
                     self._self_agent_invocation,
@@ -526,7 +512,8 @@ class _AgentRunStreamWrapper(SyncStreamWrapper[_RunStreamChunk]):
                     self._self_final_output,
                     capture_content=self._self_capture_content,
                 )
-        self._finish_once()
+        finally:
+            self._finish_once()
 
     def _on_stream_error(self, error: BaseException) -> None:
         self._finish_once(error)
@@ -539,16 +526,15 @@ def _record_agent(
     *,
     capture_content: bool,
 ) -> None:
-    with _recording("the agent"):
-        invocation.agent_description = agent.description
-        # Managed agents are exposed to the model as tools.
-        invocation.tool_definitions = to_tool_definitions(
-            [*agent.tools.values(), *agent.managed_agents.values()]
+    invocation.agent_description = agent.description
+    # Managed agents are exposed to the model as tools.
+    invocation.tool_definitions = to_tool_definitions(
+        [*agent.tools.values(), *agent.managed_agents.values()]
+    )
+    if capture_content:
+        invocation.input_messages = task_to_input_messages(
+            bound.get("task"), bound.get("images")
         )
-        if capture_content:
-            invocation.input_messages = task_to_input_messages(
-                bound.get("task"), bound.get("images")
-            )
 
 
 def _record_agent_run(
@@ -561,11 +547,10 @@ def _record_agent_run(
 ) -> _AgentRunStreamWrapper | None:
     """Record a finished run or wrap a streamed run until it is drained."""
     if capture_content and bound.get("additional_args"):
-        with _recording("the agent task"):
-            # ``run()`` appends ``additional_args`` to ``agent.task``.
-            invocation.input_messages = task_to_input_messages(
-                agent.task or bound.get("task"), bound.get("images")
-            )
+        # ``run()`` appends ``additional_args`` to ``agent.task``.
+        invocation.input_messages = task_to_input_messages(
+            agent.task or bound.get("task"), bound.get("images")
+        )
 
     if bound.get("stream") and isinstance(result, Generator):
         return _AgentRunStreamWrapper(
@@ -575,13 +560,12 @@ def _record_agent_run(
             capture_content=capture_content,
         )
 
-    with _recording("the agent run"):
-        # ``return_full_result`` can be set on the agent, so ``run(task)`` can
-        # return ``RunResult``.
-        output = result.output if isinstance(result, RunResult) else result
-        _record_run_answer(
-            invocation, agent, output, capture_content=capture_content
-        )
+    # ``return_full_result`` can be set on the agent, so ``run(task)`` can
+    # return ``RunResult``.
+    output = result.output if isinstance(result, RunResult) else result
+    _record_run_answer(
+        invocation, agent, output, capture_content=capture_content
+    )
     return None
 
 

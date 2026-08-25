@@ -711,53 +711,6 @@ def test_interrupted_run_ends_the_span(
     assert lifecycle.leaked == []
 
 
-@pytest.mark.parametrize("stream", [False, True])
-def test_a_failed_recording_does_not_break_a_finished_run(
-    instrument_with_content,
-    span_exporter,
-    lifecycle,
-    monkeypatch,
-    stream: bool,
-) -> None:
-    # A recording failure must not replace the stream's ``StopIteration``.
-    def raise_error(*args: Any, **kwargs: Any) -> Any:
-        raise ValueError("unexpected answer shape")
-
-    monkeypatch.setattr(patch_module, "final_answer_parts", raise_error)
-
-    agent = CodeAgent(tools=[], model=FakeCodeModel(), max_steps=3)
-    if stream:
-        assert list(agent.run("Test question", stream=True))
-    else:
-        assert agent.run("Test question") == "Test result from CodeAgent"
-
-    (agent_span,) = spans_by_operation(
-        span_exporter.get_finished_spans(), "invoke_agent"
-    )
-    assert agent_span.status.status_code == StatusCode.UNSET
-    assert attr(agent_span, GenAI.GEN_AI_OUTPUT_MESSAGES) is None
-    assert lifecycle.leaked == []
-
-
-def test_a_failed_recording_before_the_run_does_not_break_it(
-    instrument_with_content, span_exporter, lifecycle, monkeypatch
-) -> None:
-    def raise_error(*args: Any, **kwargs: Any) -> Any:
-        raise ValueError("unexpected tool shape")
-
-    monkeypatch.setattr(patch_module, "to_tool_definitions", raise_error)
-
-    agent = CodeAgent(tools=[], model=FakeCodeModel(), max_steps=3)
-    assert agent.run("Test question") == "Test result from CodeAgent"
-
-    (agent_span,) = spans_by_operation(
-        span_exporter.get_finished_spans(), "invoke_agent"
-    )
-    assert agent_span.status.status_code == StatusCode.UNSET
-    assert attr(agent_span, GenAI.GEN_AI_TOOL_DEFINITIONS) is None
-    assert lifecycle.leaked == []
-
-
 def test_a_model_without_a_model_id_is_supported(
     instrument_with_content, span_exporter, lifecycle
 ) -> None:
