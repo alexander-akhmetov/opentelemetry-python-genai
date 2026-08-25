@@ -14,13 +14,19 @@ from types import GeneratorType, SimpleNamespace
 from typing import Any
 
 import pytest
-from smolagents import CodeAgent, OpenAIModel, ToolCallingAgent
+from smolagents import (
+    AgentExecutionError,
+    CodeAgent,
+    OpenAIModel,
+    ToolCallingAgent,
+)
+from smolagents.memory import ActionStep, FinalAnswerStep
 from smolagents.models import (
     ChatMessage,
     ChatMessageToolCall,
     ChatMessageToolCallFunction,
 )
-from smolagents.monitoring import TokenUsage
+from smolagents.monitoring import Timing, TokenUsage
 
 from opentelemetry.instrumentation.genai.smolagents import (
     patch as patch_module,
@@ -363,6 +369,40 @@ def test_run_that_exhausts_max_steps_is_not_reported_as_a_plain_stop(
     assert attr(agent_span, error_attributes.ERROR_TYPE) is None
     outputs = parse_messages(agent_span, GenAI.GEN_AI_OUTPUT_MESSAGES)
     assert outputs[0]["finish_reason"] == "max_steps"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_terminal_step_error_is_reported_as_error_finish_reason(
+    instrument_with_content, span_exporter, monkeypatch, stream: bool
+) -> None:
+    agent = CodeAgent(tools=[], model=FakeCodeModel(), max_steps=3)
+
+    def _terminal_error(
+        *_args: Any, **_kwargs: Any
+    ) -> Generator[FinalAnswerStep, None, None]:
+        agent.memory.steps.append(
+            ActionStep(
+                step_number=1,
+                timing=Timing(start_time=0),
+                error=AgentExecutionError("terminal error", agent.logger),
+            )
+        )
+        yield FinalAnswerStep(output="fallback")
+
+    monkeypatch.setattr(agent, "_run_stream", _terminal_error)
+    if stream:
+        list(agent.run("Test question", stream=True))
+    else:
+        agent.run("Test question")
+
+    (agent_span,) = spans_by_operation(
+        span_exporter.get_finished_spans(), "invoke_agent"
+    )
+    assert attr(agent_span, GenAI.GEN_AI_RESPONSE_FINISH_REASONS) == (
+        "error",
+    )
+    outputs = parse_messages(agent_span, GenAI.GEN_AI_OUTPUT_MESSAGES)
+    assert outputs[0]["finish_reason"] == "error"
 
 
 def test_streaming_run_close_finalizes_once(

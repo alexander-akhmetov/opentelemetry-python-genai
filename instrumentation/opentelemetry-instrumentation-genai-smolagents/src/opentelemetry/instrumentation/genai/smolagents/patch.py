@@ -446,12 +446,13 @@ def _record_run_answer(
     # final ``ActionStep``.
     steps = agent.memory.steps
     last_step = steps[-1] if steps else None
-    finish_reason = (
-        "max_steps"
-        if isinstance(last_step, ActionStep)
-        and isinstance(last_step.error, AgentMaxStepsError)
-        else "stop"
-    )
+    error = last_step.error if isinstance(last_step, ActionStep) else None
+    if isinstance(error, AgentMaxStepsError):
+        finish_reason = "max_steps"
+    elif error is not None:
+        finish_reason = "error"
+    else:
+        finish_reason = "stop"
     invocation.finish_reasons = [finish_reason]
     if capture_content:
         invocation.output_messages = [
