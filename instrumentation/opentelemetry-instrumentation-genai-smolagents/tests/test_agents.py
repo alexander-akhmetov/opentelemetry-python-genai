@@ -253,6 +253,46 @@ def test_image_final_answer_is_recorded_as_a_blob(
     assert part["mime_type"] == "image/png"
 
 
+def _first_step_only(agent: CodeAgent) -> None:
+    for _ in agent.run("Test question", stream=True):
+        break
+
+
+def test_abandoned_streaming_run_finalizes_the_span(
+    instrument_with_content, span_exporter
+) -> None:
+    agent = CodeAgent(tools=[], model=FakeCodeModel(), max_steps=3)
+    _first_step_only(agent)
+    gc.collect()
+
+    assert (
+        len(
+            spans_by_operation(
+                span_exporter.get_finished_spans(), "invoke_agent"
+            )
+        )
+        == 1
+    )
+
+
+def test_abandoned_streaming_run_does_not_leak_context(
+    instrument_with_content, span_exporter, tracer_provider
+) -> None:
+    agent = CodeAgent(tools=[], model=FakeCodeModel(), max_steps=3)
+    _first_step_only(agent)
+    gc.collect()
+
+    with tracer_provider.get_tracer("test").start_as_current_span("unrelated"):
+        pass
+
+    (unrelated,) = [
+        span
+        for span in span_exporter.get_finished_spans()
+        if span.name == "unrelated"
+    ]
+    assert unrelated.parent is None
+
+
 def test_code_agent_streaming_is_lazy_until_drained(
     instrument_with_content, span_exporter
 ) -> None:
@@ -398,9 +438,7 @@ def test_terminal_step_error_is_reported_as_error_finish_reason(
     (agent_span,) = spans_by_operation(
         span_exporter.get_finished_spans(), "invoke_agent"
     )
-    assert attr(agent_span, GenAI.GEN_AI_RESPONSE_FINISH_REASONS) == (
-        "error",
-    )
+    assert attr(agent_span, GenAI.GEN_AI_RESPONSE_FINISH_REASONS) == ("error",)
     outputs = parse_messages(agent_span, GenAI.GEN_AI_OUTPUT_MESSAGES)
     assert outputs[0]["finish_reason"] == "error"
 

@@ -483,6 +483,12 @@ class _AgentRunStreamWrapper(SyncStreamWrapper[_RunStreamChunk]):
         self._self_saw_final = False
         self._self_finished = False
 
+    def __del__(self) -> None:
+        try:
+            self._finalize_success()
+        except BaseException:  # pylint: disable=broad-except
+            pass
+
     def _finish_once(self, error: BaseException | None = None) -> None:
         if self._self_finished:
             return
