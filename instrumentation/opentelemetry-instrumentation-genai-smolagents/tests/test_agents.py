@@ -357,12 +357,12 @@ def test_run_that_exhausts_max_steps_is_not_reported_as_a_plain_stop(
         span_exporter.get_finished_spans(), "invoke_agent"
     )
     assert attr(agent_span, GenAI.GEN_AI_RESPONSE_FINISH_REASONS) == (
-        "length",
+        "max_steps",
     )
     assert agent_span.status.status_code == StatusCode.UNSET
     assert attr(agent_span, error_attributes.ERROR_TYPE) is None
     outputs = parse_messages(agent_span, GenAI.GEN_AI_OUTPUT_MESSAGES)
-    assert outputs[0]["finish_reason"] == "length"
+    assert outputs[0]["finish_reason"] == "max_steps"
 
 
 def test_streaming_run_close_finalizes_once(

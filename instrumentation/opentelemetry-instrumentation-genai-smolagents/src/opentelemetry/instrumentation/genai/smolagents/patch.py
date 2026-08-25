@@ -447,7 +447,7 @@ def _record_run_answer(
     steps = agent.memory.steps
     last_step = steps[-1] if steps else None
     finish_reason = (
-        "length"
+        "max_steps"
         if isinstance(last_step, ActionStep)
         and isinstance(last_step.error, AgentMaxStepsError)
         else "stop"
