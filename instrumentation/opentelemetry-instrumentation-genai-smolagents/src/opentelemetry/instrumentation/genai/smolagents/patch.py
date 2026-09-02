@@ -343,6 +343,12 @@ class _ModelStreamWrapper(SyncStreamWrapper["ChatMessageStreamDelta"]):
         self._self_output_tokens = 0
         self._self_saw_token_usage = False
 
+    def __del__(self) -> None:
+        try:
+            self._finalize_success()
+        except BaseException:  # pylint: disable=broad-except
+            pass
+
     def _process_chunk(self, chunk: ChatMessageStreamDelta) -> None:
         content = chunk.content
         if content and self._self_capture_content:

@@ -12,6 +12,7 @@ the stubbed runtime pieces built in ``test_utils``.
 
 from __future__ import annotations
 
+import gc
 import inspect
 import json
 from collections.abc import Generator
@@ -588,6 +589,43 @@ def _failing_streamer(
 ) -> Generator[str, None, None]:
     yield from chunks
     raise error
+
+
+def _first_model_chunk_only(model: Any) -> None:
+    for _ in model.generate_stream(messages=MESSAGES):
+        break
+
+
+def test_abandoned_model_stream_finalizes_the_span(
+    instrument_with_content, span_exporter, lifecycle
+) -> None:
+    model = transformers_model(stream_chunks=["In ", "Paris"])
+    _first_model_chunk_only(model)
+    gc.collect()
+
+    assert (
+        len(spans_by_operation(span_exporter.get_finished_spans(), "chat"))
+        == 1
+    )
+    assert lifecycle.leaked == []
+
+
+def test_abandoned_model_stream_does_not_leak_context(
+    instrument_with_content, span_exporter, tracer_provider
+) -> None:
+    model = transformers_model(stream_chunks=["In ", "Paris"])
+    _first_model_chunk_only(model)
+    gc.collect()
+
+    with tracer_provider.get_tracer("test").start_as_current_span("unrelated"):
+        pass
+
+    (unrelated,) = [
+        span
+        for span in span_exporter.get_finished_spans()
+        if span.name == "unrelated"
+    ]
+    assert unrelated.parent is None
 
 
 def test_generate_stream_is_lazy_and_records_the_drained_response(
