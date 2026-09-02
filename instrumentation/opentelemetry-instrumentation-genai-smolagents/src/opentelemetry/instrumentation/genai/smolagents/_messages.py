@@ -226,8 +226,8 @@ def _tool_parameters(tool: _ModelCallable) -> dict[str, Any] | None:
         parameters = schema["function"]["parameters"]
     except BaseException:  # pylint: disable=broad-except
         _logger.debug(
-            "Failed to build a JSON Schema for tool %s",
-            tool.name,
+            "Failed to build a JSON Schema for %s",
+            type(tool).__name__,
             exc_info=True,
         )
         return None
@@ -237,25 +237,19 @@ def _tool_parameters(tool: _ModelCallable) -> dict[str, Any] | None:
 def to_tool_definitions(
     tools: Sequence[_ModelCallable] | None,
 ) -> list[ToolDefinition] | None:
-    """Map smolagents tool objects to function tool definitions.
-
-    ``Tool.validate_arguments`` requires every tool to have a non-empty
-    ``name`` and ``description``. A managed agent must also have both. An
-    invalid entry without a name is skipped instead of recorded under an empty
-    name.
-    """
+    """Map values accepted by smolagents' schema builder."""
     if not tools:
         return None
     definitions: list[ToolDefinition] = []
     for tool in tools:
-        name = tool.name
-        if not name:
+        parameters = _tool_parameters(tool)
+        if parameters is None:
             continue
         definitions.append(
             FunctionToolDefinition(
-                name=name,
+                name=cast(str, tool.name),
                 description=tool.description,
-                parameters=_tool_parameters(tool),
+                parameters=parameters,
             )
         )
     return definitions or None
@@ -268,7 +262,7 @@ def final_answer_parts(output: object) -> list[MessagePart]:
             return [blob]
         return []
     text = str.__str__(output) if isinstance(output, str) else str(output)
-    return [Text(content=text)]
+    return [TextPart(content=text)]
 
 
 def task_to_input_messages(
@@ -276,7 +270,7 @@ def task_to_input_messages(
 ) -> list[InputMessage]:
     parts: list[MessagePart] = []
     if task:
-        parts.append(Text(content=task))
+        parts.append(TextPart(content=task))
     if isinstance(images, list):
         for image in images:
             if blob := _image_blob(image):

@@ -282,25 +282,13 @@ def _record_response(
 
 
 def _start_inference(
-    handler: TelemetryHandler,
-    wrapped: Callable[..., Any],
-    instance: Model,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
+    handler: TelemetryHandler, instance: Model
 ) -> InferenceInvocation:
-    """Start the ``chat`` span and record the request.
-
-    ``generate`` and ``generate_stream`` take the same parameters. An in-process
-    runtime listens on no socket, so the span carries no ``server.address`` or
-    ``server.port``.
-    """
-    provider = resolve_provider(instance)
-    invocation = handler.inference(
-        provider,
+    """In-process runtimes have no server address or port."""
+    return handler.inference(
+        resolve_provider(instance),
         request_model=instance.model_id,
     )
-    _record_request(handler, invocation, wrapped, instance, args, kwargs)
-    return invocation
 
 
 def model_generate(handler: TelemetryHandler) -> _Wrapper[Model]:
@@ -318,8 +306,11 @@ def model_generate(handler: TelemetryHandler) -> _Wrapper[Model]:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> ChatMessage:
-        invocation = _start_inference(handler, wrapped, instance, args, kwargs)
+        invocation = _start_inference(handler, instance)
         with invocation:
+            _record_request(
+                handler, invocation, wrapped, instance, args, kwargs
+            )
             output_message = wrapped(*args, **kwargs)
             _record_response(handler, invocation, output_message)
             return output_message
@@ -409,9 +400,12 @@ def model_generate_stream(handler: TelemetryHandler) -> _Wrapper[Model]:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> _ModelStreamWrapper:
-        invocation = _start_inference(handler, wrapped, instance, args, kwargs)
+        invocation = _start_inference(handler, instance)
         with ExitStack() as finishing:
             finishing.enter_context(invocation)
+            _record_request(
+                handler, invocation, wrapped, instance, args, kwargs
+            )
             stream = _ModelStreamWrapper(
                 wrapped(*args, **kwargs), invocation, handler
             )

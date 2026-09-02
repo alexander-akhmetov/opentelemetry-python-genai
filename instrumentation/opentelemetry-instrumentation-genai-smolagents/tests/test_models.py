@@ -246,28 +246,36 @@ def test_bad_tool_does_not_leak_a_span(
 
 
 @pytest.mark.parametrize(
-    "conversion", ["to_input_messages", "to_output_message"]
+    ("method", "conversion"),
+    [
+        ("generate", "to_input_messages"),
+        ("generate", "to_output_message"),
+        ("generate_stream", "to_input_messages"),
+    ],
 )
-def test_a_failed_conversion_does_not_break_the_call(
+def test_a_failed_conversion_finalizes_the_span(
     instrument_with_content,
     span_exporter,
     lifecycle,
     monkeypatch: pytest.MonkeyPatch,
+    method: str,
     conversion: str,
 ) -> None:
-    # A shape the conversion cannot read drops the content from the span, and
-    # changes nothing else.
     def raise_error(*args: Any, **kwargs: Any) -> Any:
         raise ValueError("unexpected message shape")
 
     monkeypatch.setattr(patch_module, conversion, raise_error)
 
-    output = transformers_model().generate(messages=MESSAGES)
-    assert output.content == "In Paris"
+    model = transformers_model()
+    with pytest.raises(ValueError, match="unexpected message shape"):
+        if method == "generate_stream":
+            model.generate_stream(messages=MESSAGES)
+        else:
+            model.generate(messages=MESSAGES)
 
     (span,) = spans_by_operation(span_exporter.get_finished_spans(), "chat")
-    assert span.status.status_code == StatusCode.UNSET
-    assert attr(span, GenAI.GEN_AI_USAGE_INPUT_TOKENS) == 3
+    assert span.status.status_code == StatusCode.ERROR
+    assert attr(span, error_attributes.ERROR_TYPE) == "ValueError"
     assert lifecycle.leaked == []
 
 
